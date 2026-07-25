@@ -6,14 +6,20 @@ namespace ColonySim.Entities;
 // wasted allocations with no benefit.
 public class Inventory
 {
-  public const int Capacity = 1000;
+  public int Capacity { get; }
 
   readonly Dictionary<string, int> _counts = new();
   public IReadOnlyDictionary<string, int> Counts => _counts;
 
+  public Inventory(int capacity = 1000) => Capacity = capacity;
+
   public int Total => _counts.Values.Sum();
   public bool IsFull => Total >= Capacity;
   public int Room => Math.Max(0, Capacity - Total);
+
+  // Whether at least `count` of an item are currently on hand — used by
+  // builders deciding whether a fill task is worth claiming yet.
+  public bool Has(string item, int count) => _counts.GetValueOrDefault(item) >= count;
 
   // Adds up to `count` of an item, capped by whatever room is left.
   // Returns how many were actually added.

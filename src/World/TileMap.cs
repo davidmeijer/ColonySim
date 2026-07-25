@@ -1,6 +1,7 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
 using Raylib_cs;
+using ColonySim.Entities;
 
 namespace ColonySim.World;
 
@@ -312,7 +313,7 @@ public class TileMap
   // The sum of all 100 fine columns' heights within a coarse tile — its
   // total remaining material, independent of exactly how that material is
   // currently distributed across those columns.
-  int TotalVoxels(int x, int z)
+  public int TotalVoxels(int x, int z)
   {
     int fx0 = x * FineSubdivisions, fz0 = z * FineSubdivisions;
     int total = 0;
@@ -426,6 +427,68 @@ public class TileMap
     return needed;
   }
 
+  // --- Per-voxel dig/deposit (the task system's Dig/Deposit tools) ------
+  //
+  // The player picks an exact fine column to work on (a click, or one cell
+  // of a drag-selected rectangle — see Program.cs's UpdateVoxelDrag), and a
+  // builder always moves exactly one voxel there — no "search for the
+  // tallest column" the whole-tile Dig above does, since the column is
+  // already an explicit choice.
+
+  public bool InBoundsFine(int fx, int fz) => fx >= 0 && fz >= 0 && fx < FineWidth && fz < FineDepth;
+
+  // A single fine column's current height, in voxels — used to position the
+  // hover/queued-task highlight at the right height.
+  public int VoxelHeightAt(int fx, int fz) => InBoundsFine(fx, fz) ? _voxelHeight[fx, fz] : 0;
+
+  // Whether a specific fine column can be dug: bounded, its parent coarse
+  // tile has to be otherwise workable ground (no rock/tree/bush/campfire/
+  // deep water — same rule IsWalkable already encodes), the column itself
+  // has to have material left with a Grass/Dirt top (not bedrock), and it
+  // can't be sitting under standing water.
+  public bool CanDigVoxel(int fx, int fz)
+  {
+    if (!InBoundsFine(fx, fz)) return false;
+    if (!IsWalkable(fx / FineSubdivisions, fz / FineSubdivisions)) return false;
+    if (_voxelHeight[fx, fz] <= 0) return false;
+    var top = _voxelTop[fx, fz];
+    if (top != TileType.Grass && top != TileType.Dirt) return false;
+    return !_water.TryGetValue((fx, fz), out float w) || w <= 0f;
+  }
+
+  // Whether a specific fine column has room to grow by one more voxel —
+  // same parent-tile and water gating as CanDigVoxel, just checking height
+  // room instead of material to remove.
+  public bool CanDepositVoxel(int fx, int fz)
+  {
+    if (!InBoundsFine(fx, fz)) return false;
+    if (!IsWalkable(fx / FineSubdivisions, fz / FineSubdivisions)) return false;
+    if (_voxelHeight[fx, fz] >= MaxHeight * FineSubdivisions) return false;
+    return !_water.TryGetValue((fx, fz), out float w) || w <= 0f;
+  }
+
+  // Removes exactly the top voxel of one fine column. Returns 1 on success
+  // (matching Dig's "voxels actually removed" convention so callers can
+  // hand it straight to Inventory.Add), 0 if it wasn't diggable.
+  public int DigVoxel(int fx, int fz)
+  {
+    if (!CanDigVoxel(fx, fz)) return 0;
+    _voxelHeight[fx, fz] -= 1;
+    _voxelTop[fx, fz] = TileType.Dirt;
+    MarkChunkDirtyAt(fx, fz);
+    return 1;
+  }
+
+  // Adds exactly one voxel on top of one fine column.
+  public bool DepositVoxel(int fx, int fz)
+  {
+    if (!CanDepositVoxel(fx, fz)) return false;
+    _voxelHeight[fx, fz] += 1;
+    _voxelTop[fx, fz] = TileType.Dirt;
+    MarkChunkDirtyAt(fx, fz);
+    return true;
+  }
+
   // --- Campfires ---
 
   public IReadOnlyList<Campfire> Campfires => _campfires;
@@ -455,6 +518,22 @@ public class TileMap
     var (fx, fz) = FineCenter(x, z);
     ScorchAround(fx, fz, ScorchRadiusVoxels);
     return fire;
+  }
+
+  // Tears down a campfire a DemolishCampfire task has finished working —
+  // frees its tile back up for pathfinding. Leaves the scorched ground
+  // alone; ordinary regrowth (see StepRegrowth) will grass it back over in
+  // time same as any other patch of dry Dirt. Returns false if there was no
+  // campfire on that tile to begin with (shouldn't happen in practice,
+  // since WorkQueue prunes a demolish task the moment its target vanishes).
+  public bool RemoveCampfire(int x, int z)
+  {
+    int index = _campfires.FindIndex(f => f.TileX == x && f.TileZ == z);
+    if (index < 0) return false;
+
+    _campfires.RemoveAt(index);
+    _campfireTiles.Remove((x, z));
+    return true;
   }
 
   // Turns every Grass column within radiusVoxels of (centerFx, centerFz)

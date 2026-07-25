@@ -161,7 +161,7 @@ public class SunLight
   // isn't dark the instant the game opens.
   float _time = 0.35f;
 
-  float _speedMultiplier = 1f;
+  float _speedMultiplier = 0.1f;
 
   // Direction the light travels (sun/moon -> ground) — what the shader
   // needs. Recomputed every frame in Recompute().

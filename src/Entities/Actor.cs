@@ -27,8 +27,11 @@ public class Actor
   // and re-plans a route for it.
   public bool Stuck { get; private set; }
 
-  // What this actor is carrying.
-  public Inventory Inventory { get; } = new();
+  // Whether this actor will autonomously pull tasks off the shared
+  // WorkQueue whenever it's idle — see Program.UpdateBuilders. Actors never
+  // carry material themselves any more; digging/depositing move it
+  // straight into/out of the shared global Inventory.
+  public bool IsBuilder { get; set; }
 
   // Position of the actor's feet on the ground (plus any jump arc) — the
   // root everything else (body parts, camera picking, overlap pushes) is
@@ -171,15 +174,17 @@ public class Actor
   const float BreathRate = 1.6f; // radians of phase per second
   const float BreathAmount = HeadSize * 0.16f; // peak-to-peak torso height change
 
-  bool _digging;
-  float _digTimer;
-  const float DigDuration = 0.5f;
+  // Continuous work animation, driven by Program.UpdateBuilders while a
+  // builder is on a WorkTask — unlike Jump, this isn't a fixed-length
+  // one-shot: a task can run for many seconds, so the swing just keeps
+  // cycling (via _workPhase, uncapped) until StopWorking() is called.
+  bool _working;
+  bool _workConstructive; // true: deposit-style lean/place; false: dig-style chop
+  float _workPhase;
+  const float DigCyclePeriod = 0.5f;
   const float DigRaiseDeg = 50f;
   const float DigSwingDeg = 70f;
-
-  bool _depositing;
-  float _depositTimer;
-  const float DepositDuration = 0.5f;
+  const float DepositCyclePeriod = 0.5f;
   const float DepositLeanDeg = 18f;
   const float DepositArmDeg = 55f;
 
@@ -351,21 +356,20 @@ public class Actor
     _jumpTimer = 0f;
   }
 
-  // Cosmetic swing/lean animations, triggered whenever Program.cs performs
-  // the corresponding action (the dig/deposit itself always happens
-  // instantly regardless — these are purely a visual flourish layered on
-  // top, same as Jump above).
-  public void PlayDig()
+  // Starts (or re-styles) the looping work swing — called once a builder
+  // arrives at a WorkTask's stand tile, and again if the task's direction
+  // changes. constructive picks the deposit-style lean/place motion over
+  // the dig-style chop.
+  public void StartWorking(bool constructive)
   {
-    _digging = true;
-    _digTimer = 0f;
+    _working = true;
+    _workConstructive = constructive;
+    _workPhase = 0f;
   }
 
-  public void PlayDeposit()
-  {
-    _depositing = true;
-    _depositTimer = 0f;
-  }
+  // Called once a task completes, is cancelled, or the actor gets pulled
+  // off it by a manual order.
+  public void StopWorking() => _working = false;
 
   void UpdateJump(float dt)
   {
@@ -376,17 +380,7 @@ public class Actor
 
   void UpdateActionTimers(float dt)
   {
-    if (_digging)
-    {
-      _digTimer += dt;
-      if (_digTimer >= DigDuration) _digging = false;
-    }
-
-    if (_depositing)
-    {
-      _depositTimer += dt;
-      if (_depositTimer >= DepositDuration) _depositing = false;
-    }
+    if (_working) _workPhase += dt;
   }
 
   // A sine arc: 0 at takeoff and landing, peaking at JumpHeight halfway
@@ -427,17 +421,18 @@ public class Actor
     _poseRightArmDeg = swing * ArmSwingScale;
     _poseTorsoLeanDeg = 0f;
 
-    if (_digging)
+    if (_working && !_workConstructive)
     {
-      // A single swing: raised back at the start, chopping forward/down
-      // through the midpoint, settling back by the end.
-      float p = Math.Clamp(_digTimer / DigDuration, 0f, 1f);
+      // A repeating swing: raised back at the start of each cycle, chopping
+      // forward/down through the midpoint, settling back by the end —
+      // loops for as long as the task takes rather than firing once.
+      float p = _workPhase % DigCyclePeriod / DigCyclePeriod;
       _poseRightArmDeg = -DigRaiseDeg + (DigRaiseDeg + DigSwingDeg) * MathF.Sin(p * MathF.PI);
     }
 
-    if (_depositing)
+    if (_working && _workConstructive)
     {
-      float p = Math.Clamp(_depositTimer / DepositDuration, 0f, 1f);
+      float p = _workPhase % DepositCyclePeriod / DepositCyclePeriod;
       float blend = MathF.Sin(p * MathF.PI);
       _poseTorsoLeanDeg = blend * DepositLeanDeg;
       _poseLeftArmDeg = blend * DepositArmDeg;

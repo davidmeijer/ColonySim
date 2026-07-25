@@ -4,6 +4,7 @@ using ColonySim.World;
 using ColonySim.Entities;
 using ColonySim.Pathfinding;
 using ColonySim.Rendering;
+using ColonySim.Tasks;
 
 namespace ColonySim;
 
@@ -35,8 +36,10 @@ public static class Program
     // so Update (input) and Draw (rendering) can each compute the same
     // rectangles independently without sharing extra layout state.
     static readonly Rectangle JumpButtonRect = new(10, ScreenHeight - 66, 80, 28);
-    static readonly Rectangle DigButtonRect = new(100, ScreenHeight - 66, 80, 28);
-    static readonly Rectangle DepositButtonRect = new(190, ScreenHeight - 66, 100, 28);
+
+    // Toggles Actor.IsBuilder for the whole current selection — the only
+    // way actors get assigned work now; see Program.UpdateBuilders.
+    static readonly Rectangle BuilderButtonRect = new(100, ScreenHeight - 66, 100, 28);
 
     // Top-right gear icon, always visible, that opens/closes the settings
     // panel below it. Everything in the panel (grid toggle, path-dots
@@ -73,22 +76,45 @@ public static class Program
         public bool DraggingSpeed;
     }
 
-    // Top-left build icon (kept well clear of the "Selected: x/y" text next
-    // to it, and of the settings gear in the opposite corner) that opens a
-    // small palette of placeable items. Picking an item arms Placing —
-    // the next left-click on a valid tile drops it there.
-    static readonly Rectangle BuildButtonRect = new(150, 10, 36, 36);
+    // Top build icon (kept clear of the "Selected: x/y" HUD text to its
+    // left, the settings gear at the opposite corner, and — since its own
+    // panel opens directly beneath it — clear of the task queue panel's
+    // footprint too) that opens a small palette of work-order tools.
+    // Picking one arms ArmedTool — the next left-click on a valid tile
+    // queues a WorkTask there instead of touching the map directly (see
+    // WorkQueue / Program.UpdateBuilders).
+    static readonly Rectangle BuildButtonRect = new(260, 10, 36, 36);
+
+    // Which tool (if any) is currently armed from the build palette.
+    enum ToolKind { None, Campfire, DemolishCampfire, Dig, Deposit }
 
     const float BuildPanelWidth = 150f;
-    const float BuildPanelX = 150f;
+    const float BuildPanelX = 260f;
     const float BuildPanelY = 56f;
-    static readonly Rectangle BuildPanelRect = new(BuildPanelX, BuildPanelY, BuildPanelWidth, 54f);
-    static readonly Rectangle CampfireItemRect = new(BuildPanelX + 8, BuildPanelY + 8, BuildPanelWidth - 16, 38);
+    const int BuildPaletteRows = 4;
+    const float BuildRowHeight = 46f;
+    static readonly Rectangle BuildPanelRect = new(BuildPanelX, BuildPanelY, BuildPanelWidth, 8f + BuildPaletteRows * BuildRowHeight);
+
+    static Rectangle BuildPaletteItemRect(int row) => new(BuildPanelX + 8, BuildPanelY + 8 + row * BuildRowHeight, BuildPanelWidth - 16, 38);
+    static readonly Rectangle CampfireItemRect = BuildPaletteItemRect(0);
+    static readonly Rectangle DemolishCampfireItemRect = BuildPaletteItemRect(1);
+    static readonly Rectangle DigItemRect = BuildPaletteItemRect(2);
+    static readonly Rectangle DepositItemRect = BuildPaletteItemRect(3);
 
     class BuildMenuState
     {
         public bool Open;
-        public bool Placing; // an item is armed; the next tile click places it
+        public ToolKind ArmedTool = ToolKind.None;
+
+        // Voxel drag-select state (Dig/Deposit only): where the drag
+        // started — in both screen space (to measure the drag threshold,
+        // same as every other drag gesture in this file) and fine-voxel
+        // space (the actual selection) — and whether it's turned into a
+        // real drag yet. Mirrors SelectionState's actor box-select, just
+        // picking fine voxels instead of actors.
+        public Vector2? LeftDownScreenPos;
+        public (int Fx, int Fz)? DragStartVoxel;
+        public bool VoxelDragging;
 
         // Tracked separately from SelectionState's identical right-click
         // fields so a right-drag to orbit the camera while lining up a
@@ -96,6 +122,37 @@ public static class Program
         public Vector2? RightDownPos;
         public bool RightDragged;
     }
+
+    // --- Task queue panel (left edge) --------------------------------------
+    const float QueuePanelX = 10f;
+    const float QueuePanelY = 56f;
+    const float QueuePanelWidth = 230f;
+    const float QueueRowHeight = 40f;
+    const int QueueMaxVisibleRows = 10;
+
+    static Rectangle TaskQueuePanelRect(int taskCount)
+    {
+        int rows = Math.Min(taskCount, QueueMaxVisibleRows);
+        float height = 34f + Math.Max(rows, 1) * QueueRowHeight;
+        return new Rectangle(QueuePanelX, QueuePanelY, QueuePanelWidth, height);
+    }
+
+    static Rectangle TaskQueueCancelRect(int row) =>
+        new(QueuePanelX + QueuePanelWidth - 26, QueuePanelY + 34 + row * QueueRowHeight + 4, 18, 18);
+
+    // --- Work task timing/tuning --------------------------------------------
+    // Dig/Deposit always move exactly one voxel, so their duration is just
+    // a flat per-action time rather than scaling with any distance/count.
+    const float DigVoxelDuration = 0.15f;
+    const float DepositVoxelDuration = 0.15f;
+    const float BuildCampfireDuration = 1.5f;
+    const float DemolishCampfireDuration = 1f;
+
+    // Safety clamp on a single drag-select's footprint (Dig/Deposit) — the
+    // queue and per-frame builder scans are all O(task count), so a stray
+    // drag across most of the map shouldn't be allowed to create tens of
+    // thousands of tasks in one go.
+    const int MaxDragVoxelsPerAxis = 60;
 
     public static void Main()
     {
@@ -116,6 +173,13 @@ public static class Program
         var buildMenu = new BuildMenuState();
         bool showGrid = false;
         bool showPathDots = false;
+
+        // The colony's shared work-order list and shared material pool —
+        // see src/Tasks/WorkQueue.cs. Actors never carry material of their
+        // own; a dig deposits straight into this pool, and a fill task
+        // spends straight out of it.
+        var workQueue = new WorkQueue();
+        var globalInventory = new Inventory(capacity: 100_000);
 
         // A slowly-drifting directional light, so faces catch shading
         // depending on which way they point — that plus TileMap's block
@@ -149,11 +213,11 @@ public static class Program
             // movement by dt makes speeds frame-rate independent.
             float dt = Raylib.GetFrameTime();
 
-            Update(dt, map, actors, selection, settingsMenu, buildMenu, sun, ref camera, ref camTarget, ref camYaw, ref camPitch, ref camDistance, ref showGrid, ref showPathDots);
+            Update(dt, map, actors, selection, settingsMenu, buildMenu, workQueue, globalInventory, sun, ref camera, ref camTarget, ref camYaw, ref camPitch, ref camDistance, ref showGrid, ref showPathDots);
             map.UpdateWater(dt);
             map.UpdateVegetation(dt);
             sun.Update(dt);
-            Draw(map, actors, selection, settingsMenu, buildMenu, camera, sun, showGrid, showPathDots);
+            Draw(map, actors, selection, settingsMenu, buildMenu, workQueue, globalInventory, camera, sun, showGrid, showPathDots);
         }
 
         sun.Unload();
@@ -162,7 +226,7 @@ public static class Program
     }
 
     static void Update(float dt, TileMap map, List<Actor> actors, SelectionState selection, SettingsMenuState settingsMenu,
-        BuildMenuState buildMenu, SunLight sun, ref Camera3D camera, ref Vector3 camTarget, ref float yaw, ref float pitch,
+        BuildMenuState buildMenu, WorkQueue workQueue, Inventory globalInventory, SunLight sun, ref Camera3D camera, ref Vector3 camTarget, ref float yaw, ref float pitch,
         ref float distance, ref bool showGrid, ref bool showPathDots)
     {
         // --- Zoom with the mouse wheel, clamped to a sane range ---
@@ -210,26 +274,32 @@ public static class Program
 
         bool shiftHeld = Raylib.IsKeyDown(KeyboardKey.LeftShift) || Raylib.IsKeyDown(KeyboardKey.RightShift);
 
-        // The build menu is checked first: while an item is armed
-        // (Placing), it swallows every click itself, so the settings panel
-        // and action menu are skipped entirely for that frame — otherwise a
-        // placement click that happens to land over one of their buttons
-        // (bottom-left action menu, top-right settings) would fire that
-        // button instead of placing anything.
-        bool buildConsumedClick = UpdateBuildMenu(map, buildMenu, camera);
+        // The build menu is checked first: while a tool is armed, it
+        // swallows every click itself, so the settings panel and action menu
+        // are skipped entirely for that frame — otherwise a placement click
+        // that happens to land over one of their buttons (bottom-left
+        // action menu, top-right settings) would fire that button instead of
+        // placing anything.
+        bool armed = buildMenu.ArmedTool != ToolKind.None;
+        bool buildConsumedClick = UpdateBuildMenu(map, workQueue, buildMenu, camera);
+
+        // The task queue panel (left edge) needs the same treatment: a click
+        // on its cancel buttons shouldn't also fall through to a world click.
+        bool queueConsumedClick = !armed && UpdateTaskQueuePanel(workQueue);
 
         // The settings panel lives outside the selection-driven action menu
         // (it has to work with nothing selected), but its clicks still need
         // consuming for the same reason: otherwise they'd also register as
         // world clicks and stomp the selection.
-        bool settingsConsumedClick = !buildMenu.Placing && UpdateSettingsMenu(sun, settingsMenu, ref showGrid, ref showPathDots);
+        bool settingsConsumedClick = !armed && UpdateSettingsMenu(sun, settingsMenu, ref showGrid, ref showPathDots);
 
         // Action-menu clicks are handled first and, if one lands, consumed —
         // otherwise clicking "Jump" would also register as a world click and
         // immediately clear the very selection you just acted on.
-        bool menuConsumedClick = !buildMenu.Placing && UpdateActionMenu(map, selection);
-        UpdateSelection(actors, selection, camera, shiftHeld, menuConsumedClick || settingsConsumedClick || buildConsumedClick);
-        if (!buildMenu.Placing) UpdateMoveOrders(map, actors, selection, camera);
+        bool menuConsumedClick = !armed && UpdateActionMenu(map, selection);
+        UpdateSelection(actors, selection, camera, shiftHeld,
+            menuConsumedClick || settingsConsumedClick || buildConsumedClick || queueConsumedClick);
+        if (!armed) UpdateMoveOrders(map, actors, selection, camera, workQueue);
 
         // Everyone seeks their own next waypoint independently — no per-tile
         // locking — then overlaps get shoved apart, then anyone who's made
@@ -240,7 +310,8 @@ public static class Program
         foreach (var actor in actors) actor.Update(dt);
         ResolveOverlaps(actors);
         RepathStuckActors(map, actors);
-        UpdateWandering(map, actors);
+        UpdateBuilders(map, actors, workQueue, globalInventory, dt);
+        UpdateWandering(map, actors, workQueue);
     }
 
     // Soft collision: pushes any pair of actors that end up closer than two
@@ -291,6 +362,156 @@ public static class Program
         }
     }
 
+    // Drops whatever WorkTask this actor currently holds (if any) back into
+    // the unclaimed pool — its Progress is left untouched, so another
+    // builder can pick it up later without losing what's already been done.
+    // Called whenever a manual move order interrupts a builder mid-task.
+    static void ReleaseAssignment(WorkQueue workQueue, Actor actor)
+    {
+        var task = workQueue.Tasks.FirstOrDefault(t => t.Worker == actor);
+        if (task == null) return;
+
+        task.Worker = null;
+        task.Started = false;
+        task.Progress = 0f;
+        actor.StopWorking();
+    }
+
+    // Every IsBuilder actor either keeps working whatever WorkTask it's
+    // already holding, or — once truly idle — claims the next one it can
+    // actually do. Runs after RepathStuckActors (so a builder's own
+    // stuck-recovery has already happened this frame) and before
+    // UpdateWandering (so a builder with real work available never gets
+    // sent ambling instead of doing it — once TryAssignTask gives it a
+    // path, IsMoving is true and WantsToWander naturally no longer holds).
+    static void UpdateBuilders(TileMap map, List<Actor> actors, WorkQueue workQueue, Inventory globalInventory, float dt)
+    {
+        workQueue.Prune(map);
+
+        foreach (var actor in actors)
+        {
+            if (!actor.IsBuilder) continue;
+
+            var task = workQueue.Tasks.FirstOrDefault(t => t.Worker == actor);
+            if (task == null)
+            {
+                if (!actor.IsMoving) TryAssignTask(map, actors, workQueue, globalInventory, actor);
+                continue;
+            }
+
+            bool arrived = !actor.IsMoving && actor.TileX == task.StandX && actor.TileZ == task.StandZ;
+            if (!arrived) continue;
+
+            if (!task.Started)
+            {
+                actor.StartWorking(IsConstructive(task));
+                task.Started = true;
+            }
+
+            task.Progress += dt;
+            if (task.Progress < task.Duration) continue;
+
+            // At/past the required work time — try to actually apply the
+            // effect. Dig always succeeds; Deposit can come up short on
+            // material and just keeps waiting here, retried every
+            // subsequent frame, until the pool refills.
+            if (TryComplete(task, map, globalInventory))
+            {
+                actor.StopWorking();
+                task.Complete = true;
+            }
+        }
+
+        // Drop anything that finished (or was satisfied by something else)
+        // this frame so the queue panel and in-world bars never show stale
+        // work for even one extra frame.
+        workQueue.Prune(map);
+    }
+
+    // Scans the queue in order for the first unclaimed, currently-doable
+    // task this actor can actually path to, claims it, and sends it on its
+    // way — same AStar/SetPath plumbing as a manual move order. Leaves the
+    // actor idle for this frame if nothing qualifies.
+    static void TryAssignTask(TileMap map, List<Actor> actors, WorkQueue workQueue, Inventory globalInventory, Actor actor)
+    {
+        var blockingTiles = BlockingTiles(actors, except: actor);
+
+        foreach (var candidate in workQueue.ClaimableInOrder(map, globalInventory))
+        {
+            var path = AStar.FindPath(map, actor.TileX, actor.TileZ, candidate.StandX, candidate.StandZ,
+                PathBlocker(blockingTiles, actor));
+            if (path.Count == 0) continue;
+
+            candidate.Worker = actor;
+            candidate.Started = false;
+            candidate.Progress = 0f;
+            actor.SetPath(path);
+            return;
+        }
+    }
+
+    // Whether a task's work animation should be the constructive
+    // (deposit-lean) pose or the destructive (dig-chop) one.
+    static bool IsConstructive(WorkTask task) => task.Kind switch
+    {
+        TaskKind.BuildCampfire or TaskKind.Deposit => true,
+        _ => false,
+    };
+
+    // Applies a finished task's effect. Returns false only for Deposit
+    // running out of material right at the moment of completion —
+    // everything else always succeeds once its Duration has elapsed.
+    static bool TryComplete(WorkTask task, TileMap map, Inventory globalInventory) => task.Kind switch
+    {
+        TaskKind.Dig => CompleteDig(task, map, globalInventory),
+        TaskKind.Deposit => CompleteDeposit(task, map, globalInventory),
+        TaskKind.BuildCampfire => map.PlaceCampfire(task.TileX, task.TileZ) != null,
+        TaskKind.DemolishCampfire => map.RemoveCampfire(task.TileX, task.TileZ),
+        _ => true,
+    };
+
+    // A voxel that's since become undiggable (someone else got there first,
+    // or the terrain changed underneath) is still a "done, nothing more to
+    // do" outcome, not a stall — only Deposit's material check can actually
+    // hold a task open waiting.
+    static bool CompleteDig(WorkTask task, TileMap map, Inventory globalInventory)
+    {
+        int dug = map.DigVoxel(task.FineX, task.FineZ);
+        if (dug > 0) globalInventory.Add("Dirt", dug);
+        return true;
+    }
+
+    static bool CompleteDeposit(WorkTask task, TileMap map, Inventory globalInventory)
+    {
+        if (!globalInventory.TryRemove("Dirt", 1)) return false;
+        return map.DepositVoxel(task.FineX, task.FineZ);
+    }
+
+    // Left-click on a queued task's cancel "x" removes it (releasing its
+    // worker, if any); left-click anywhere else inside the panel just
+    // consumes the click so it doesn't fall through to a world click.
+    // Returns false (consuming nothing) when the queue is empty, since the
+    // panel isn't even drawn then.
+    static bool UpdateTaskQueuePanel(WorkQueue workQueue)
+    {
+        if (workQueue.Tasks.Count == 0) return false;
+        if (!Raylib.IsMouseButtonPressed(MouseButton.Left)) return false;
+
+        Vector2 mouse = Raylib.GetMousePosition();
+        int shown = Math.Min(workQueue.Tasks.Count, QueueMaxVisibleRows);
+        for (int i = 0; i < shown; i++)
+        {
+            if (!Raylib.CheckCollisionPointRec(mouse, TaskQueueCancelRect(i))) continue;
+
+            var task = workQueue.Tasks[i];
+            if (task.Worker is { } worker) worker.StopWorking();
+            workQueue.Cancel(task);
+            return true;
+        }
+
+        return Raylib.CheckCollisionPointRec(mouse, TaskQueuePanelRect(workQueue.Tasks.Count));
+    }
+
     // How far (in coarse tiles) an idle actor might wander off to, and how
     // many random spots it'll try before giving up for this attempt (see
     // Actor.DeferWander) — small numbers on purpose, so this reads as
@@ -304,11 +525,21 @@ public static class Program
     // real player order, so a wandering actor gets stuck-detection,
     // auto-reroute, and give-up behaviour for free, and a player order
     // issued mid-wander overrides it exactly like it would anything else.
-    static void UpdateWandering(TileMap map, List<Actor> actors)
+    //
+    // Actor has no concept of "standing still on purpose" — WantsToWander
+    // only ever sees an empty path plus an idle timer, which is exactly
+    // what a builder stationed on a WorkTask looks like once it arrives.
+    // Without excluding assigned workers here, one would eventually wander
+    // off mid-dig (still playing the work animation, since nothing told it
+    // to stop) while its task's Progress simply stopped advancing — see
+    // UpdateBuilders' `arrived` check, which requires the actor to still be
+    // standing on the stand tile.
+    static void UpdateWandering(TileMap map, List<Actor> actors, WorkQueue workQueue)
     {
         foreach (var actor in actors)
         {
             if (!actor.WantsToWander) continue;
+            if (workQueue.Tasks.Any(t => t.Worker == actor)) continue;
 
             if (PickWanderTile(map, actor.TileX, actor.TileZ) is not { } target)
             {
@@ -430,41 +661,15 @@ public static class Program
             return true;
         }
 
-        if (Raylib.CheckCollisionPointRec(mouse, DigButtonRect))
+        if (Raylib.CheckCollisionPointRec(mouse, BuilderButtonRect))
         {
-            // Digs the whole topmost layer at once, capped by whatever room
-            // is left in each actor's inventory. Silently does nothing for
-            // an actor that isn't standing on Grass or Dirt, or has no room
-            // at all. No explicit re-snap needed: Actor.Update re-reads the
-            // ground height under it every frame, so it settles automatically.
-            foreach (var actor in selection.Selected)
-            {
-                int room = actor.Inventory.Room;
-                if (room <= 0) continue;
-                int dug = map.Dig(actor.TileX, actor.TileZ, room);
-                if (dug > 0)
-                {
-                    actor.Inventory.Add("Dirt", dug);
-                    actor.PlayDig();
-                }
-            }
-            return true;
-        }
-
-        if (Raylib.CheckCollisionPointRec(mouse, DepositButtonRect))
-        {
-            // Silently does nothing for an actor that doesn't have enough
-            // carried voxels to top off its current tile's partial level,
-            // or whose tile is already at the maximum height.
-            foreach (var actor in selection.Selected)
-            {
-                int needed = map.VoxelsNeededToRaise(actor.TileX, actor.TileZ);
-                if (actor.Inventory.Total < needed) continue;
-                if (map.Deposit(actor.TileX, actor.TileZ) == 0) continue;
-
-                actor.Inventory.TryRemove("Dirt", needed);
-                actor.PlayDeposit();
-            }
+            // Same "all -> off, anything else -> on" toggle style as the
+            // settings panel's Freeze button: if every selected actor is
+            // already a builder, unset them all; otherwise make them all
+            // builders. Builders autonomously pull work off the shared
+            // WorkQueue — see UpdateBuilders.
+            bool allBuilders = selection.Selected.All(a => a.IsBuilder);
+            foreach (var actor in selection.Selected) actor.IsBuilder = !allBuilders;
             return true;
         }
 
@@ -548,7 +753,7 @@ public static class Program
 
     // Right-click (a click, not a camera-orbit drag): send every selected
     // actor toward the clicked tile, each to its own nearby free spot.
-    static void UpdateMoveOrders(TileMap map, List<Actor> actors, SelectionState selection, Camera3D camera)
+    static void UpdateMoveOrders(TileMap map, List<Actor> actors, SelectionState selection, Camera3D camera, WorkQueue workQueue)
     {
         if (Raylib.IsMouseButtonPressed(MouseButton.Right))
         {
@@ -578,6 +783,12 @@ public static class Program
                 {
                     var path = AStar.FindPath(map, actor.TileX, actor.TileZ, dest.X, dest.Z,
                         PathBlocker(blockingTiles, actor));
+
+                    // A manual order always wins over whatever work-queue
+                    // assignment this actor was mid-way through — release it
+                    // (progress is kept on the task itself) so another
+                    // builder can pick it back up later.
+                    ReleaseAssignment(workQueue, actor);
                     actor.SetPath(path);
                 }
             }
@@ -588,14 +799,16 @@ public static class Program
     }
 
     // Ray-casts from a screen position through every coarse tile's column
-    // bounds and returns the nearest one hit — the shared "what tile is the
-    // mouse over" query used by move orders and campfire placement alike.
-    static bool TryPickTile(TileMap map, Camera3D camera, Vector2 screenPos, out int tileX, out int tileZ)
+    // bounds and returns the nearest hit point — the shared "what point on
+    // the ground is the mouse over" query both TryPickTile (coarse) and
+    // TryPickVoxel (fine) derive their own result from.
+    static bool TryPickGround(TileMap map, Camera3D camera, Vector2 screenPos, out Vector3 hitPoint)
     {
         Ray ray = Raylib.GetScreenToWorldRay(screenPos, camera);
 
-        int hitX = -1, hitZ = -1;
         float bestDist = float.MaxValue;
+        hitPoint = default;
+        bool hitAny = false;
         for (int x = 0; x < map.Width; x++)
         {
             for (int z = 0; z < map.Depth; z++)
@@ -604,24 +817,53 @@ public static class Program
                 if (hit.Hit && hit.Distance < bestDist)
                 {
                     bestDist = hit.Distance;
-                    hitX = x;
-                    hitZ = z;
+                    hitPoint = hit.Point;
+                    hitAny = true;
                 }
             }
         }
 
-        tileX = hitX;
-        tileZ = hitZ;
-        return hitX >= 0;
+        return hitAny;
     }
 
-    // The build icon toggles the palette; picking "Campfire" arms Placing,
-    // and the very next left-click (wherever it lands, on a valid tile or
-    // not) either places the fire or is simply swallowed — see the
-    // Placing-gated calls in Update() for why every other click handler
-    // steps aside while this is true. Right-click or Escape cancels
-    // placement without closing anything else.
-    static bool UpdateBuildMenu(TileMap map, BuildMenuState menu, Camera3D camera)
+    // Which coarse tile the mouse is over — used by move orders and
+    // campfire placement.
+    static bool TryPickTile(TileMap map, Camera3D camera, Vector2 screenPos, out int tileX, out int tileZ)
+    {
+        if (!TryPickGround(map, camera, screenPos, out Vector3 hitPoint))
+        {
+            tileX = tileZ = -1;
+            return false;
+        }
+
+        tileX = Math.Clamp((int)MathF.Floor(hitPoint.X / TileMap.TileSize), 0, map.Width - 1);
+        tileZ = Math.Clamp((int)MathF.Floor(hitPoint.Z / TileMap.TileSize), 0, map.Depth - 1);
+        return true;
+    }
+
+    // Which exact fine voxel column the mouse is over — the finer-grained
+    // pick Dig/Deposit's per-voxel selection needs.
+    static bool TryPickVoxel(TileMap map, Camera3D camera, Vector2 screenPos, out int fineX, out int fineZ)
+    {
+        if (!TryPickGround(map, camera, screenPos, out Vector3 hitPoint))
+        {
+            fineX = fineZ = -1;
+            return false;
+        }
+
+        fineX = Math.Clamp((int)MathF.Floor(hitPoint.X / TileMap.VoxelSize), 0, map.Width * TileMap.FineSubdivisions - 1);
+        fineZ = Math.Clamp((int)MathF.Floor(hitPoint.Z / TileMap.VoxelSize), 0, map.Depth * TileMap.FineSubdivisions - 1);
+        return true;
+    }
+
+    // The build icon toggles the palette; picking a tool arms it. Campfire/
+    // DemolishCampfire act on a plain click (like before); Dig/Deposit
+    // instead go through UpdateVoxelDrag, which supports both a single
+    // click and a drag-select rectangle of fine voxels. Right-click or
+    // Escape cancels without closing anything else. Campfire disarms after
+    // a single click (placing one thing at a time); every other tool stays
+    // armed so the player can stamp out several tasks in a row.
+    static bool UpdateBuildMenu(TileMap map, WorkQueue workQueue, BuildMenuState menu, Camera3D camera)
     {
         Vector2 mouse = Raylib.GetMousePosition();
         bool leftPressed = Raylib.IsMouseButtonPressed(MouseButton.Left);
@@ -629,15 +871,16 @@ public static class Program
         if (leftPressed && Raylib.CheckCollisionPointRec(mouse, BuildButtonRect))
         {
             menu.Open = !menu.Open;
-            if (!menu.Open) menu.Placing = false;
+            if (!menu.Open) { menu.ArmedTool = ToolKind.None; ResetVoxelDrag(menu); }
             return true;
         }
 
-        if (menu.Placing)
+        if (menu.ArmedTool != ToolKind.None)
         {
             if (Raylib.IsKeyPressed(KeyboardKey.Escape))
             {
-                menu.Placing = false;
+                menu.ArmedTool = ToolKind.None;
+                ResetVoxelDrag(menu);
                 return true;
             }
 
@@ -661,16 +904,21 @@ public static class Program
                 menu.RightDragged = false;
                 if (!wasDrag)
                 {
-                    menu.Placing = false;
+                    menu.ArmedTool = ToolKind.None;
+                    ResetVoxelDrag(menu);
                     return true;
                 }
             }
 
+            if (menu.ArmedTool is ToolKind.Dig or ToolKind.Deposit)
+            {
+                UpdateVoxelDrag(map, workQueue, menu, camera);
+                return true;
+            }
+
             if (leftPressed)
             {
-                if (TryPickTile(map, camera, mouse, out int tx, out int tz) && map.CanPlaceCampfire(tx, tz))
-                    map.PlaceCampfire(tx, tz);
-                menu.Placing = false;
+                TryPlaceArmedTool(map, workQueue, menu, camera);
                 return true;
             }
 
@@ -681,12 +929,10 @@ public static class Program
 
         if (leftPressed)
         {
-            if (Raylib.CheckCollisionPointRec(mouse, CampfireItemRect))
-            {
-                menu.Placing = true;
-                menu.Open = false;
-                return true;
-            }
+            if (Raylib.CheckCollisionPointRec(mouse, CampfireItemRect)) { menu.ArmedTool = ToolKind.Campfire; menu.Open = false; return true; }
+            if (Raylib.CheckCollisionPointRec(mouse, DemolishCampfireItemRect)) { menu.ArmedTool = ToolKind.DemolishCampfire; menu.Open = false; return true; }
+            if (Raylib.CheckCollisionPointRec(mouse, DigItemRect)) { menu.ArmedTool = ToolKind.Dig; menu.Open = false; return true; }
+            if (Raylib.CheckCollisionPointRec(mouse, DepositItemRect)) { menu.ArmedTool = ToolKind.Deposit; menu.Open = false; return true; }
 
             if (Raylib.CheckCollisionPointRec(mouse, BuildPanelRect)) return true;
 
@@ -694,6 +940,117 @@ public static class Program
         }
 
         return false;
+    }
+
+    // Applies Campfire/DemolishCampfire (the two coarse-tile tools) to the
+    // tile under the mouse — queuing a WorkTask on success, doing nothing
+    // on an invalid tile. Disarms afterward only for Campfire;
+    // DemolishCampfire stays armed for repeated stamping.
+    static void TryPlaceArmedTool(TileMap map, WorkQueue workQueue, BuildMenuState menu, Camera3D camera)
+    {
+        if (!TryPickTile(map, camera, Raylib.GetMousePosition(), out int tx, out int tz))
+        {
+            if (menu.ArmedTool == ToolKind.Campfire) menu.ArmedTool = ToolKind.None;
+            return;
+        }
+
+        switch (menu.ArmedTool)
+        {
+            case ToolKind.Campfire:
+                if (map.CanPlaceCampfire(tx, tz))
+                    workQueue.Enqueue(WorkTask.ForCampfire(TaskKind.BuildCampfire, tx, tz, tx, tz, BuildCampfireDuration));
+                menu.ArmedTool = ToolKind.None;
+                break;
+
+            case ToolKind.DemolishCampfire:
+                if (map.Campfires.Any(f => f.TileX == tx && f.TileZ == tz) &&
+                    NearestWalkableNeighbor(map, tx, tz) is { } stand)
+                {
+                    workQueue.Enqueue(WorkTask.ForCampfire(TaskKind.DemolishCampfire, tx, tz, stand.X, stand.Z, DemolishCampfireDuration));
+                }
+                break;
+        }
+    }
+
+    // Dig/Deposit's own input handling: press-drag-release over the fine
+    // voxel grid, the same press/threshold/release shape UpdateSelection
+    // uses for the actor box-select, just picking fine voxels instead of
+    // actors. A plain click (no real drag) queues just the one voxel under
+    // the cursor; a real drag queues every valid voxel in the rectangle
+    // between where the drag started and where it ended.
+    static void UpdateVoxelDrag(TileMap map, WorkQueue workQueue, BuildMenuState menu, Camera3D camera)
+    {
+        Vector2 mouse = Raylib.GetMousePosition();
+
+        if (Raylib.IsMouseButtonPressed(MouseButton.Left))
+        {
+            menu.LeftDownScreenPos = mouse;
+            menu.VoxelDragging = false;
+            menu.DragStartVoxel = TryPickVoxel(map, camera, mouse, out int fx, out int fz) ? (fx, fz) : null;
+        }
+
+        if (Raylib.IsMouseButtonDown(MouseButton.Left) && menu.LeftDownScreenPos is { } down)
+        {
+            if (Vector2.Distance(down, mouse) > DragThreshold) menu.VoxelDragging = true;
+        }
+
+        if (Raylib.IsMouseButtonReleased(MouseButton.Left) && menu.DragStartVoxel is { } start)
+        {
+            bool haveEnd = TryPickVoxel(map, camera, mouse, out int endFx, out int endFz);
+
+            if (menu.VoxelDragging && haveEnd)
+            {
+                int minFx = Math.Min(start.Fx, endFx);
+                int maxFx = Math.Min(Math.Max(start.Fx, endFx), minFx + MaxDragVoxelsPerAxis - 1);
+                int minFz = Math.Min(start.Fz, endFz);
+                int maxFz = Math.Min(Math.Max(start.Fz, endFz), minFz + MaxDragVoxelsPerAxis - 1);
+
+                for (int fx = minFx; fx <= maxFx; fx++)
+                    for (int fz = minFz; fz <= maxFz; fz++)
+                        EnqueueVoxelTask(workQueue, map, menu.ArmedTool, fx, fz);
+            }
+            else
+            {
+                EnqueueVoxelTask(workQueue, map, menu.ArmedTool, start.Fx, start.Fz);
+            }
+
+            ResetVoxelDrag(menu);
+        }
+    }
+
+    static void ResetVoxelDrag(BuildMenuState menu)
+    {
+        menu.LeftDownScreenPos = null;
+        menu.DragStartVoxel = null;
+        menu.VoxelDragging = false;
+    }
+
+    // Queues one Dig or Deposit task for a single fine voxel — silently
+    // does nothing if that exact voxel isn't a legal target right now, or
+    // already has a pending task of the same kind (repeated clicks/drags
+    // over the same spot shouldn't pile up duplicate work).
+    static void EnqueueVoxelTask(WorkQueue workQueue, TileMap map, ToolKind tool, int fineX, int fineZ)
+    {
+        TaskKind kind = tool == ToolKind.Dig ? TaskKind.Dig : TaskKind.Deposit;
+        bool valid = kind == TaskKind.Dig ? map.CanDigVoxel(fineX, fineZ) : map.CanDepositVoxel(fineX, fineZ);
+        if (!valid || workQueue.HasPendingVoxelTask(kind, fineX, fineZ)) return;
+
+        float duration = kind == TaskKind.Dig ? DigVoxelDuration : DepositVoxelDuration;
+        workQueue.Enqueue(WorkTask.ForVoxel(kind, fineX, fineZ, duration));
+    }
+
+    // The nearest walkable orthogonal neighbour of a tile that's itself
+    // unwalkable (a campfire) — where a DemolishCampfire task's worker has
+    // to stand, since it can't stand on the fire itself. Null in the (rare)
+    // case all four sides are blocked too.
+    static (int X, int Z)? NearestWalkableNeighbor(TileMap map, int x, int z)
+    {
+        foreach (var (dx, dz) in new[] { (1, 0), (-1, 0), (0, 1), (0, -1) })
+        {
+            int nx = x + dx, nz = z + dz;
+            if (map.IsWalkable(nx, nz)) return (nx, nz);
+        }
+        return null;
     }
 
     // Tiles that should be routed around like solid rock: actors standing
@@ -761,7 +1118,7 @@ public static class Program
     }
 
     static void Draw(TileMap map, List<Actor> actors, SelectionState selection, SettingsMenuState settingsMenu,
-        BuildMenuState buildMenu, Camera3D camera, SunLight sun, bool showGrid, bool showPathDots)
+        BuildMenuState buildMenu, WorkQueue workQueue, Inventory globalInventory, Camera3D camera, SunLight sun, bool showGrid, bool showPathDots)
     {
         // Every campfire's point light, refreshed each frame (flicker means
         // even a stationary fire's colour keeps changing) — has to happen
@@ -813,18 +1170,35 @@ public static class Program
         if (showGrid) map.DrawOutlines();
         foreach (var actor in actors) actor.DrawOutline();
 
-        // A ghost ring on whichever tile the mouse is over while an item is
-        // armed: green if it's a legal spot, red if not (water, a tree, an
-        // existing fire, ...), so the player knows before clicking.
-        if (buildMenu.Placing && TryPickTile(map, camera, Raylib.GetMousePosition(), out int hoverX, out int hoverZ))
+        // A persistent blue glow around every voxel with a queued Dig/
+        // Deposit task on it — the moment a voxel is selected it marks
+        // itself this way, and it stays marked until a builder actually
+        // gets to it (the task leaving workQueue.Tasks, via Prune, is what
+        // makes the glow disappear).
+        foreach (var task in workQueue.Tasks.Where(t => t.Kind is TaskKind.Dig or TaskKind.Deposit && !t.Complete))
+            DrawVoxelMarker(map, task.FineX, task.FineZ, task.Kind == TaskKind.Deposit, Color.SkyBlue, wireOnly: true);
+
+        // A ghost preview on whichever tile/voxel the mouse is over while a
+        // tool is armed: orange for Campfire (matching its previous
+        // colour), blue-ish for Dig/Deposit, red whenever the hovered spot
+        // isn't a legal target — so the player knows before clicking.
+        if (buildMenu.ArmedTool is ToolKind.Campfire or ToolKind.DemolishCampfire &&
+            TryPickTile(map, camera, Raylib.GetMousePosition(), out int hoverX, out int hoverZ))
         {
-            bool valid = map.CanPlaceCampfire(hoverX, hoverZ);
+            bool valid = buildMenu.ArmedTool == ToolKind.Campfire
+                ? map.CanPlaceCampfire(hoverX, hoverZ)
+                : map.Campfires.Any(f => f.TileX == hoverX && f.TileZ == hoverZ);
             Color ringColor = valid ? new Color(255, 170, 60, 220) : new Color(220, 60, 60, 220);
+
             Vector3 ringCenter = new(
                 hoverX * TileMap.TileSize + TileMap.TileSize / 2f,
                 map.SurfaceY(hoverX, hoverZ) + 2f,
                 hoverZ * TileMap.TileSize + TileMap.TileSize / 2f);
             Raylib.DrawCircle3D(ringCenter, TileMap.TileSize * 0.45f, new Vector3(1f, 0f, 0f), 90f, ringColor);
+        }
+        else if (buildMenu.ArmedTool is ToolKind.Dig or ToolKind.Deposit)
+        {
+            DrawVoxelToolPreview(map, buildMenu, camera);
         }
 
         Raylib.EndMode3D();
@@ -840,36 +1214,145 @@ public static class Program
             Raylib.DrawRectangleLinesEx(rect, 1.5f, Color.Lime);
         }
 
+        // A small completion bar hovering over every task currently being
+        // worked, projected from its tile (or, for Dig/Deposit, its exact
+        // voxel) into screen space.
+        foreach (var task in workQueue.Tasks.Where(t => t.Started && !t.Complete))
+        {
+            Vector3 worldPos = task.Kind is TaskKind.Dig or TaskKind.Deposit
+                ? new Vector3(
+                    task.FineX * TileMap.VoxelSize + TileMap.VoxelSize / 2f,
+                    map.VoxelHeightAt(task.FineX, task.FineZ) * TileMap.VoxelSize + TileMap.TileSize * 0.3f,
+                    task.FineZ * TileMap.VoxelSize + TileMap.VoxelSize / 2f)
+                : new Vector3(
+                    task.TileX * TileMap.TileSize + TileMap.TileSize / 2f,
+                    map.SurfaceY(task.TileX, task.TileZ) + TileMap.TileSize * 0.9f,
+                    task.TileZ * TileMap.TileSize + TileMap.TileSize / 2f);
+            Vector2 screenPos = Raylib.GetWorldToScreen(worldPos, camera);
+
+            const float barWidth = 40f, barHeight = 6f;
+            var track = new Rectangle(screenPos.X - barWidth / 2f, screenPos.Y - barHeight / 2f, barWidth, barHeight);
+            Raylib.DrawRectangleRec(track, new Color(50, 50, 50, 180));
+            float t = task.Duration > 0f ? Math.Clamp(task.Progress / task.Duration, 0f, 1f) : 1f;
+            Raylib.DrawRectangle((int)track.X, (int)track.Y, (int)(t * track.Width), (int)track.Height, new Color(120, 190, 120, 255));
+        }
+
         // The HUD is drawn in *screen* space, so it stays put.
+        string globalItems = globalInventory.Counts.Count == 0
+            ? "(empty)"
+            : string.Join(", ", globalInventory.Counts.Select(kv => $"{kv.Key} x{kv.Value}"));
         Raylib.DrawText($"Selected: {selection.Selected.Count}/{actors.Count}", 10, 10, 18, Color.Black);
+        Raylib.DrawText($"Global inventory: {globalItems}", 10, 32, 16, Color.Black);
 
         DrawSettingsMenu(sun, settingsMenu, showGrid, showPathDots);
         DrawBuildMenu(buildMenu);
+        DrawTaskQueue(workQueue);
 
         // The action menu, only while something's selected.
         if (selection.Selected.Count > 0)
         {
             DrawButton(JumpButtonRect, "Jump");
-            DrawButton(DigButtonRect, "Dig");
-            DrawButton(DepositButtonRect, "Deposit");
-
-            if (selection.Selected.Count == 1)
-            {
-                var actor = selection.Selected.First();
-                string items = actor.Inventory.Counts.Count == 0
-                    ? "(empty)"
-                    : string.Join(", ", actor.Inventory.Counts.Select(kv => $"{kv.Key} x{kv.Value}"));
-                int needed = map.VoxelsNeededToRaise(actor.TileX, actor.TileZ);
-                Raylib.DrawText(
-                    $"Inventory ({actor.Inventory.Total}/{Inventory.Capacity}): {items}   " +
-                    $"(deposit needs {needed})",
-                    300, ScreenHeight - 58, 16, Color.Black);
-            }
+            DrawButton(BuilderButtonRect, "Builder", active: selection.Selected.All(a => a.IsBuilder));
         }
 
         Raylib.DrawFPS(10, ScreenHeight - 30);
 
         Raylib.EndDrawing();
+    }
+
+    // Where a Dig/Deposit ghost/marker box for one fine voxel should sit:
+    // hugging the current top voxel for Dig (that's what would be removed),
+    // or the not-yet-there next slot up for Deposit (that's where the new
+    // one would land).
+    static Vector3 VoxelMarkerCenter(TileMap map, int fineX, int fineZ, bool isDeposit)
+    {
+        int voxelLevel = map.VoxelHeightAt(fineX, fineZ) + (isDeposit ? 1 : 0);
+        return new Vector3(
+            fineX * TileMap.VoxelSize + TileMap.VoxelSize / 2f,
+            (voxelLevel - 0.5f) * TileMap.VoxelSize,
+            fineZ * TileMap.VoxelSize + TileMap.VoxelSize / 2f);
+    }
+
+    // Draws one voxel's marker box — either just a wireframe glow (the
+    // persistent "this voxel is queued" indicator) or a solid translucent
+    // fill plus wireframe (the interactive hover/drag preview, colour-coded
+    // by validity). A Dig marker at ground level (nothing left there) is
+    // skipped rather than drawn as a flat sliver.
+    static void DrawVoxelMarker(TileMap map, int fineX, int fineZ, bool isDeposit, Color color, bool wireOnly)
+    {
+        if (!isDeposit && map.VoxelHeightAt(fineX, fineZ) <= 0) return;
+
+        Vector3 center = VoxelMarkerCenter(map, fineX, fineZ, isDeposit);
+        if (!wireOnly)
+        {
+            Color fill = new(color.R, color.G, color.B, (byte)140);
+            Raylib.DrawCube(center, TileMap.VoxelSize * 0.94f, TileMap.VoxelSize * 0.94f, TileMap.VoxelSize * 0.94f, fill);
+        }
+        Raylib.DrawCubeWires(center, TileMap.VoxelSize, TileMap.VoxelSize, TileMap.VoxelSize, color);
+    }
+
+    // The interactive Dig/Deposit hover preview: a single voxel box under
+    // the cursor, or — mid-drag — one box per cell of the whole rectangle
+    // between where the drag started and the current hover, each coloured
+    // blue if it's a legal target or red if not.
+    static void DrawVoxelToolPreview(TileMap map, BuildMenuState menu, Camera3D camera)
+    {
+        Vector2 mouse = Raylib.GetMousePosition();
+        if (!TryPickVoxel(map, camera, mouse, out int hoverFx, out int hoverFz)) return;
+
+        int minFx = hoverFx, maxFx = hoverFx, minFz = hoverFz, maxFz = hoverFz;
+        if (menu.VoxelDragging && menu.DragStartVoxel is { } start)
+        {
+            minFx = Math.Min(start.Fx, hoverFx); maxFx = Math.Min(Math.Max(start.Fx, hoverFx), minFx + MaxDragVoxelsPerAxis - 1);
+            minFz = Math.Min(start.Fz, hoverFz); maxFz = Math.Min(Math.Max(start.Fz, hoverFz), minFz + MaxDragVoxelsPerAxis - 1);
+        }
+
+        bool isDeposit = menu.ArmedTool == ToolKind.Deposit;
+        for (int fx = minFx; fx <= maxFx; fx++)
+        {
+            for (int fz = minFz; fz <= maxFz; fz++)
+            {
+                bool valid = isDeposit ? map.CanDepositVoxel(fx, fz) : map.CanDigVoxel(fx, fz);
+                Color color = valid ? new Color(70, 140, 230, 255) : new Color(220, 60, 60, 255);
+                DrawVoxelMarker(map, fx, fz, isDeposit, color, wireOnly: false);
+            }
+        }
+    }
+
+    // The task queue panel along the left edge: one row per queued/
+    // in-progress WorkTask (label, progress bar, cancel "x"), capped at
+    // QueueMaxVisibleRows with an overflow line for the rest. Not drawn at
+    // all when the queue is empty.
+    static void DrawTaskQueue(WorkQueue workQueue)
+    {
+        if (workQueue.Tasks.Count == 0) return;
+
+        var panelRect = TaskQueuePanelRect(workQueue.Tasks.Count);
+        Raylib.DrawRectangleRec(panelRect, new Color(245, 245, 245, 235));
+        Raylib.DrawRectangleLinesEx(panelRect, 1.5f, Color.DarkGray);
+        Raylib.DrawText("Task Queue", (int)QueuePanelX + 10, (int)QueuePanelY + 8, 16, Color.Black);
+
+        int shown = Math.Min(workQueue.Tasks.Count, QueueMaxVisibleRows);
+        for (int i = 0; i < shown; i++)
+        {
+            var task = workQueue.Tasks[i];
+            float rowY = QueuePanelY + 34 + i * QueueRowHeight;
+
+            Raylib.DrawText(task.Label, (int)QueuePanelX + 10, (int)rowY, 14, Color.Black);
+
+            var barTrack = new Rectangle(QueuePanelX + 10, rowY + 18, QueuePanelWidth - 44, 6);
+            Raylib.DrawRectangleRec(barTrack, new Color(210, 210, 210, 255));
+            float t = task.Duration > 0f ? Math.Clamp(task.Progress / task.Duration, 0f, 1f) : 0f;
+            Raylib.DrawRectangle((int)barTrack.X, (int)barTrack.Y, (int)(t * barTrack.Width), (int)barTrack.Height, new Color(120, 190, 120, 255));
+
+            var cancelRect = TaskQueueCancelRect(i);
+            Raylib.DrawRectangleRec(cancelRect, new Color(230, 120, 120, 255));
+            Raylib.DrawText("x", (int)(cancelRect.X + 5), (int)(cancelRect.Y + 1), 14, Color.Black);
+        }
+
+        if (workQueue.Tasks.Count > shown)
+            Raylib.DrawText($"+{workQueue.Tasks.Count - shown} more", (int)QueuePanelX + 10,
+                (int)(QueuePanelY + 34 + shown * QueueRowHeight), 14, Color.DarkGray);
     }
 
     // active marks a toggle button as currently "on" (e.g. the grid button
@@ -908,17 +1391,22 @@ public static class Program
         DrawSlider(SpeedSliderTrack, $"Speed: {sun.SpeedMultiplier:0.0}x", sun.SpeedMultiplier, MinSpeed, MaxSpeed);
     }
 
-    // The build icon plus, when open, a small palette of placeable items
-    // (currently just Campfire) — or, while an item is armed, a hint that
-    // placement mode is active instead of the palette itself.
+    // The build icon plus, when open, the palette of work-order tools — or,
+    // while one is armed, a hint instead of the palette itself.
     static void DrawBuildMenu(BuildMenuState menu)
     {
-        DrawButton(BuildButtonRect, "+", active: menu.Open || menu.Placing);
+        DrawButton(BuildButtonRect, "+", active: menu.Open || menu.ArmedTool != ToolKind.None);
 
-        if (menu.Placing)
+        if (menu.ArmedTool != ToolKind.None)
         {
-            Raylib.DrawText("Click a tile to place the campfire (Esc / right-click to cancel)",
-                (int)BuildButtonRect.X, (int)(BuildButtonRect.Y + BuildButtonRect.Height + 6), 16, Color.Black);
+            string hint = menu.ArmedTool switch
+            {
+                ToolKind.Campfire => "Click a tile to place the campfire (Esc / right-click to cancel)",
+                ToolKind.DemolishCampfire => "Click a campfire to demolish it (Esc / right-click to cancel)",
+                ToolKind.Dig or ToolKind.Deposit => "Click a voxel, or drag to select several (Esc / right-click to cancel)",
+                _ => "",
+            };
+            Raylib.DrawText(hint, (int)BuildButtonRect.X, (int)(BuildButtonRect.Y + BuildButtonRect.Height + 6), 16, Color.Black);
             return;
         }
 
@@ -927,6 +1415,9 @@ public static class Program
         Raylib.DrawRectangleRec(BuildPanelRect, new Color(245, 245, 245, 235));
         Raylib.DrawRectangleLinesEx(BuildPanelRect, 1.5f, Color.DarkGray);
         DrawButton(CampfireItemRect, "Campfire");
+        DrawButton(DemolishCampfireItemRect, "Demolish Fire");
+        DrawButton(DigItemRect, "Dig");
+        DrawButton(DepositItemRect, "Deposit");
     }
 
     // A gear-shaped icon button: a ring of teeth around a circular hub,
