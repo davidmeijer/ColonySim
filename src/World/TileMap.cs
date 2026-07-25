@@ -190,7 +190,11 @@ public class TileMap
   readonly float[,] _dryTime;
   float _regrowthTimer;
 
-  public TileMap(int width, int depth, int seed)
+  // generate=false skips procedural generation entirely, leaving a blank
+  // (all-air, dry) map — used when restoring a saved game, where every
+  // voxel/tree/bush/campfire/spring is about to be populated explicitly by
+  // the loader instead (see SetVoxel, AddLoaded*, CreateForLoad).
+  public TileMap(int width, int depth, int seed, bool generate = true)
   {
     Width = width;
     Depth = depth;
@@ -204,35 +208,101 @@ public class TileMap
 
     LoadMaterialTextures();
 
-    var generated = WorldGenerator.GenerateRollingHillsWithLake(
-      width, depth, FineSubdivisions, MaxHeight * FineSubdivisions, seed);
-
-    _voxelHeight = generated.VoxelHeight;
-    _voxelTop = generated.VoxelTop;
-    _dryTime = new float[FineWidth, FineDepth];
-
-    _waterSim = new WaterSim(FineWidth, FineDepth, _voxelHeight, ChunkSize);
-    foreach (var (pos, waterDepth) in generated.Water)
-      _waterSim.AddWater(pos.Fx, pos.Fz, waterDepth);
-
-    foreach (var tree in generated.Trees)
+    if (generate)
     {
-      _trees.Add(tree);
-      _treeTiles.Add((tree.TileX, tree.TileZ));
+      var generated = WorldGenerator.GenerateRollingHillsWithLake(
+        width, depth, FineSubdivisions, MaxHeight * FineSubdivisions, seed);
+
+      _voxelHeight = generated.VoxelHeight;
+      _voxelTop = generated.VoxelTop;
+      _dryTime = new float[FineWidth, FineDepth];
+
+      _waterSim = new WaterSim(FineWidth, FineDepth, _voxelHeight, ChunkSize);
+      foreach (var (pos, waterDepth) in generated.Water)
+        _waterSim.AddWater(pos.Fx, pos.Fz, waterDepth);
+
+      foreach (var tree in generated.Trees)
+      {
+        _trees.Add(tree);
+        _treeTiles.Add((tree.TileX, tree.TileZ));
+      }
+
+      foreach (var bush in generated.Bushes)
+      {
+        _bushes.Add(bush);
+        _bushTiles.Add((bush.TileX, bush.TileZ));
+      }
+
+      foreach (var (springX, springZ) in generated.Springs)
+      {
+        _springs.Add(new Spring(springX, springZ));
+        _springTiles.Add((springX, springZ));
+      }
     }
-
-    foreach (var bush in generated.Bushes)
+    else
     {
-      _bushes.Add(bush);
-      _bushTiles.Add((bush.TileX, bush.TileZ));
-    }
-
-    foreach (var (springX, springZ) in generated.Springs)
-    {
-      _springs.Add(new Spring(springX, springZ));
-      _springTiles.Add((springX, springZ));
+      _voxelHeight = new int[FineWidth, FineDepth];
+      _voxelTop = new TileType[FineWidth, FineDepth];
+      _dryTime = new float[FineWidth, FineDepth];
+      _waterSim = new WaterSim(FineWidth, FineDepth, _voxelHeight, ChunkSize);
     }
   }
+
+  // A blank map for SaveSystem.Load to populate voxel-by-voxel — see the
+  // generate=false branch above.
+  public static TileMap CreateForLoad(int width, int depth) => new(width, depth, seed: 0, generate: false);
+
+  // --- Save/load support ---------------------------------------------------
+  //
+  // Plain setters/adders used only while restoring a saved game (see
+  // SaveSystem.Load) — normal gameplay always goes through Dig/Deposit/
+  // PlaceCampfire/etc., which enforce the rules those actions are allowed to
+  // break; a load is instead handed a state that was already valid when it
+  // was saved, so it just needs to be poured back in directly.
+
+  public IReadOnlyList<Tree> Trees => _trees;
+  public IReadOnlyList<Bush> Bushes => _bushes;
+
+  public TileType VoxelTopAt(int fx, int fz) => InBoundsFine(fx, fz) ? _voxelTop[fx, fz] : TileType.Air;
+
+  public void SetVoxel(int fx, int fz, int height, TileType top)
+  {
+    if (!InBoundsFine(fx, fz)) return;
+    _voxelHeight[fx, fz] = height;
+    _voxelTop[fx, fz] = top;
+  }
+
+  public void SetWaterDepth(int fx, int fz, float depth) => _waterSim.SetDepth(fx, fz, depth);
+
+  public void AddLoadedTree(Tree tree)
+  {
+    _trees.Add(tree);
+    _treeTiles.Add((tree.TileX, tree.TileZ));
+  }
+
+  public void AddLoadedBush(Bush bush)
+  {
+    _bushes.Add(bush);
+    _bushTiles.Add((bush.TileX, bush.TileZ));
+  }
+
+  public void AddLoadedCampfire(Campfire campfire)
+  {
+    _campfires.Add(campfire);
+    _campfireTiles.Add((campfire.TileX, campfire.TileZ));
+  }
+
+  public void AddLoadedSpring(Spring spring)
+  {
+    _springs.Add(spring);
+    _springTiles.Add((spring.TileX, spring.TileZ));
+  }
+
+  // Called once every voxel/tree/bush/campfire/spring has been poured back
+  // in — makes sure every chunk actually gets (re)built from the loaded
+  // state on the first frame rather than relying on whatever dirty flags
+  // happened to be left over.
+  public void FinishLoading() => MarkAllChunksDirty();
 
   // Looks for Assets/Textures/{grass,dirt,rock}.{png,jpg,jpeg} next to the
   // built executable — see Assets/Textures/README.md for exactly what to

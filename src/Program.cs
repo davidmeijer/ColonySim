@@ -1,3 +1,4 @@
+using System.IO;
 using System.Numerics;
 using Raylib_cs;
 using ColonySim.World;
@@ -13,6 +14,85 @@ public static class Program
     const int ScreenWidth = 1280;
     const int ScreenHeight = 720;
     const int ActorCount = 3;
+    const int WorldWidth = 40;
+    const int WorldDepth = 30;
+
+    // Everything a running game needs — built fresh by NewGame or restored
+    // by SaveSystem.Load, and torn down by Unload when the window closes or
+    // the player returns to the main menu. Plain public fields (not
+    // properties) throughout: Update/Draw's camera parameters are `ref`,
+    // which only works against a field, not a property.
+    public class GameSession
+    {
+        public TileMap Map = null!;
+        public List<Actor> Actors = null!;
+        public SelectionState Selection = new();
+        public SettingsMenuState SettingsMenu = new();
+        public BuildMenuState BuildMenu = new();
+        public WorkQueue WorkQueue = new();
+        public Inventory GlobalInventory = new(capacity: 100_000);
+        public SunLight Sun = null!;
+        public Camera3D Camera;
+        public Vector3 CamTarget;
+        public float CamYaw = 45f;
+        public float CamPitch = 50f;
+        public float CamDistance = 620f;
+        public bool ShowGrid;
+        public bool ShowPathDots;
+        public int Seed;
+
+        // A brief "Saved!" confirmation next to the save button — set by
+        // UpdateSaveButton, counted down and drawn each frame.
+        public string? SaveMessage;
+        public float SaveMessageTimer;
+
+        public static GameSession NewGame(int seed)
+        {
+            var map = new TileMap(WorldWidth, WorldDepth, seed);
+
+            var spawnRng = new Random(99);
+            var spawnTiles = map.WalkableTiles().OrderBy(_ => spawnRng.Next()).Take(ActorCount).ToList();
+            var actors = spawnTiles.Select(t => new Actor(map, t.X, t.Y)).ToList();
+
+            var sun = new SunLight();
+            map.SetTerrainShader(sun.Shader);
+
+            var camTarget = new Vector3(map.WidthPx / 2f, 0f, map.DepthPx / 2f);
+
+            return new GameSession
+            {
+                Map = map,
+                Actors = actors,
+                Sun = sun,
+                Seed = seed,
+                CamTarget = camTarget,
+                Camera = new Camera3D
+                {
+                    Target = camTarget,
+                    Up = new Vector3(0f, 1f, 0f),
+                    FovY = 45f,
+                    Projection = CameraProjection.Perspective,
+                },
+            };
+        }
+
+        public void Save(string path) => SaveSystem.Save(path, this);
+
+        public void Unload()
+        {
+            Sun.Unload();
+            Map.Unload();
+        }
+    }
+
+    // The startup screen's own input state: the seed text box, and any
+    // error to show if a load fails.
+    class MainMenuState
+    {
+        public string SeedText = "1234";
+        public bool SeedFieldFocused;
+        public string? StatusMessage;
+    }
 
     // How far (in screen pixels) the mouse has to move while a button is held
     // before a press+release counts as a drag instead of a click.
@@ -20,7 +100,7 @@ public static class Program
 
     // Mutable input/selection state for the frame loop. Bundled into one
     // object instead of a growing pile of ref parameters.
-    class SelectionState
+    public class SelectionState
     {
         public readonly HashSet<Actor> Selected = new();
 
@@ -69,12 +149,23 @@ public static class Program
     // State for the settings panel: whether it's open, and whether a slider
     // inside it is currently being dragged (has to persist across frames,
     // same reason SelectionState does).
-    class SettingsMenuState
+    public class SettingsMenuState
     {
         public bool Open;
         public bool DraggingTime;
         public bool DraggingSpeed;
     }
+
+    // Save button: always visible during play, off to the right of the HUD
+    // text and well clear of the build palette so it never overlaps either.
+    static readonly Rectangle SaveButtonRect = new(320, 10, 90, 36);
+    const float SaveMessageDuration = 2f;
+
+    // --- Main menu (startup screen) -----------------------------------------
+    static readonly Rectangle SeedBoxRect = new(ScreenWidth / 2f - 110, 320, 220, 36);
+    static readonly Rectangle NewGameButtonRect = new(ScreenWidth / 2f - 110, 378, 220, 42);
+    static readonly Rectangle LoadGameButtonRect = new(ScreenWidth / 2f - 110, 430, 220, 42);
+    const int MaxSeedDigits = 9;
 
     // Top build icon (kept clear of the "Selected: x/y" HUD text to its
     // left, the settings gear at the opposite corner, and — since its own
@@ -86,7 +177,7 @@ public static class Program
     static readonly Rectangle BuildButtonRect = new(260, 10, 36, 36);
 
     // Which tool (if any) is currently armed from the build palette.
-    enum ToolKind { None, Campfire, DemolishCampfire, Spring, DemolishSpring, Dig, Deposit }
+    public enum ToolKind { None, Campfire, DemolishCampfire, Spring, DemolishSpring, Dig, Deposit }
 
     const float BuildPanelWidth = 150f;
     const float BuildPanelX = 260f;
@@ -103,7 +194,7 @@ public static class Program
     static readonly Rectangle DigItemRect = BuildPaletteItemRect(4);
     static readonly Rectangle DepositItemRect = BuildPaletteItemRect(5);
 
-    class BuildMenuState
+    public class BuildMenuState
     {
         public bool Open;
         public ToolKind ArmedTool = ToolKind.None;
@@ -167,50 +258,12 @@ public static class Program
         Raylib.InitWindow(ScreenWidth, ScreenHeight, "Colony Sim - v0.3 (3D)");
         Raylib.SetTargetFPS(60);
 
-        // The world: a voxel grid with height. The seed makes generation repeatable.
-        var map = new TileMap(40, 30, seed: 1234);
+        var menu = new MainMenuState();
 
-        // A roster of actors, scattered across distinct walkable tiles.
-        var spawnRng = new Random(99);
-        var spawnTiles = map.WalkableTiles().OrderBy(_ => spawnRng.Next()).Take(ActorCount).ToList();
-        var actors = spawnTiles.Select(t => new Actor(map, t.X, t.Y)).ToList();
-
-        var selection = new SelectionState();
-        var settingsMenu = new SettingsMenuState();
-        var buildMenu = new BuildMenuState();
-        bool showGrid = false;
-        bool showPathDots = false;
-
-        // The colony's shared work-order list and shared material pool —
-        // see src/Tasks/WorkQueue.cs. Actors never carry material of their
-        // own; a dig deposits straight into this pool, and a fill task
-        // spends straight out of it.
-        var workQueue = new WorkQueue();
-        var globalInventory = new Inventory(capacity: 100_000);
-
-        // A slowly-drifting directional light, so faces catch shading
-        // depending on which way they point — that plus TileMap's block
-        // outlines are what make the hills read as 3D instead of a flat
-        // green blob.
-        var sun = new SunLight();
-
-        // The terrain mesh draws through its own material, not
-        // BeginShaderMode, so it has to be wired to the sun's shader explicitly.
-        map.SetTerrainShader(sun.Shader);
-
-        // Orbit-camera state: where it's looking, and its angle/distance from that point.
-        var camTarget = new Vector3(map.WidthPx / 2f, 0f, map.DepthPx / 2f);
-        float camYaw = 45f;
-        float camPitch = 50f;
-        float camDistance = 620f;
-
-        var camera = new Camera3D
-        {
-            Target = camTarget,
-            Up = new Vector3(0f, 1f, 0f),
-            FovY = 45f,
-            Projection = CameraProjection.Perspective
-        };
+        // Null until the player either starts a new game or loads one from
+        // the startup screen — see UpdateMainMenu. Everything below only
+        // runs once a session actually exists.
+        GameSession? session = null;
 
         // The main loop. WindowShouldClose() becomes true when the user hits the
         // window's close button or presses ESC.
@@ -220,19 +273,144 @@ public static class Program
             // movement by dt makes speeds frame-rate independent.
             float dt = Raylib.GetFrameTime();
 
-            Update(dt, map, actors, selection, settingsMenu, buildMenu, workQueue, globalInventory, sun, ref camera, ref camTarget, ref camYaw, ref camPitch, ref camDistance, ref showGrid, ref showPathDots);
-            map.UpdateWater(dt);
-            map.UpdateVegetation(dt);
-            sun.Update(dt);
-            Draw(map, actors, selection, settingsMenu, buildMenu, workQueue, globalInventory, camera, sun, showGrid, showPathDots);
+            if (session == null)
+            {
+                UpdateMainMenu(menu, ref session);
+                DrawMainMenu(menu);
+                continue;
+            }
+
+            Update(dt, session, session.Map, session.Actors, session.Selection, session.SettingsMenu, session.BuildMenu,
+                session.WorkQueue, session.GlobalInventory, session.Sun,
+                ref session.Camera, ref session.CamTarget, ref session.CamYaw, ref session.CamPitch, ref session.CamDistance,
+                ref session.ShowGrid, ref session.ShowPathDots);
+            session.Map.UpdateWater(dt);
+            session.Map.UpdateVegetation(dt);
+            session.Sun.Update(dt);
+            if (session.SaveMessageTimer > 0f) session.SaveMessageTimer = Math.Max(0f, session.SaveMessageTimer - dt);
+
+            Draw(session, session.Map, session.Actors, session.Selection, session.SettingsMenu, session.BuildMenu,
+                session.WorkQueue, session.GlobalInventory, session.Camera, session.Sun, session.ShowGrid, session.ShowPathDots);
         }
 
-        sun.Unload();
-        map.Unload();
+        session?.Unload();
         Raylib.CloseWindow();
     }
 
-    static void Update(float dt, TileMap map, List<Actor> actors, SelectionState selection, SettingsMenuState settingsMenu,
+    // The startup screen's own input handling: typing/backspacing digits
+    // into the seed box, and the two buttons that either spin up a fresh
+    // GameSession from that seed or restore one from the save file. Assigns
+    // `session` on success, which is what switches Main's loop over to
+    // actual gameplay from the next frame on.
+    static void UpdateMainMenu(MainMenuState menu, ref GameSession? session)
+    {
+        Vector2 mouse = Raylib.GetMousePosition();
+        bool leftPressed = Raylib.IsMouseButtonPressed(MouseButton.Left);
+
+        if (leftPressed)
+            menu.SeedFieldFocused = Raylib.CheckCollisionPointRec(mouse, SeedBoxRect);
+
+        if (menu.SeedFieldFocused)
+        {
+            int key = Raylib.GetCharPressed();
+            while (key > 0)
+            {
+                if (key >= '0' && key <= '9' && menu.SeedText.Length < MaxSeedDigits)
+                    menu.SeedText += (char)key;
+                key = Raylib.GetCharPressed();
+            }
+
+            if (Raylib.IsKeyPressed(KeyboardKey.Backspace) && menu.SeedText.Length > 0)
+                menu.SeedText = menu.SeedText[..^1];
+        }
+
+        bool saveExists = File.Exists(SaveSystem.DefaultPath);
+
+        if (!leftPressed) return;
+
+        if (Raylib.CheckCollisionPointRec(mouse, NewGameButtonRect))
+        {
+            int seed = int.TryParse(menu.SeedText, out int parsed) ? parsed : Environment.TickCount;
+            session = GameSession.NewGame(seed);
+        }
+        else if (saveExists && Raylib.CheckCollisionPointRec(mouse, LoadGameButtonRect))
+        {
+            try
+            {
+                session = SaveSystem.Load(SaveSystem.DefaultPath);
+            }
+            catch (Exception ex)
+            {
+                menu.StatusMessage = $"Couldn't load save: {ex.Message}";
+            }
+        }
+    }
+
+    static void DrawMainMenu(MainMenuState menu)
+    {
+        Raylib.BeginDrawing();
+        Raylib.ClearBackground(new Color(38, 58, 40, 255));
+
+        const string title = "Colony Sim";
+        int titleWidth = Raylib.MeasureText(title, 48);
+        Raylib.DrawText(title, (ScreenWidth - titleWidth) / 2, 180, 48, Color.White);
+
+        Raylib.DrawText("Seed", (int)SeedBoxRect.X, (int)SeedBoxRect.Y - 22, 16, Color.White);
+        Raylib.DrawRectangleRec(SeedBoxRect, Color.White);
+        Raylib.DrawRectangleLinesEx(SeedBoxRect, 2f, menu.SeedFieldFocused ? Color.SkyBlue : Color.DarkGray);
+        Raylib.DrawText(menu.SeedText, (int)SeedBoxRect.X + 10, (int)SeedBoxRect.Y + 8, 20, Color.Black);
+
+        DrawMenuButton(NewGameButtonRect, "New Game", enabled: true);
+
+        bool saveExists = File.Exists(SaveSystem.DefaultPath);
+        DrawMenuButton(LoadGameButtonRect, saveExists ? "Load Game" : "Load Game (none saved)", saveExists);
+
+        if (menu.StatusMessage is { } status)
+        {
+            int w = Raylib.MeasureText(status, 16);
+            Raylib.DrawText(status, (ScreenWidth - w) / 2, (int)LoadGameButtonRect.Y + 60, 16, new Color(255, 160, 120, 255));
+        }
+
+        Raylib.EndDrawing();
+    }
+
+    static void DrawMenuButton(Rectangle rect, string label, bool enabled)
+    {
+        bool hovered = enabled && Raylib.CheckCollisionPointRec(Raylib.GetMousePosition(), rect);
+        Color fill = !enabled
+            ? new Color(130, 130, 130, 255)
+            : hovered ? new Color(140, 200, 140, 255) : new Color(200, 230, 200, 255);
+        Raylib.DrawRectangleRec(rect, fill);
+        Raylib.DrawRectangleLinesEx(rect, 2f, enabled ? Color.DarkGreen : Color.Gray);
+
+        int textWidth = Raylib.MeasureText(label, 18);
+        Raylib.DrawText(label, (int)(rect.X + (rect.Width - textWidth) / 2f), (int)(rect.Y + 12), 18, Color.Black);
+    }
+
+    // The always-visible in-game save button: writes the whole session to
+    // SaveSystem.DefaultPath and pops up a brief confirmation. Returns
+    // whether this frame's click landed on it, so the caller can keep it
+    // out of world/selection clicks the same way every other UI element here does.
+    static bool UpdateSaveButton(GameSession session)
+    {
+        if (!Raylib.IsMouseButtonPressed(MouseButton.Left)) return false;
+        if (!Raylib.CheckCollisionPointRec(Raylib.GetMousePosition(), SaveButtonRect)) return false;
+
+        session.Save(SaveSystem.DefaultPath);
+        session.SaveMessage = "Saved!";
+        session.SaveMessageTimer = SaveMessageDuration;
+        return true;
+    }
+
+    static void DrawSaveButton(GameSession session)
+    {
+        DrawButton(SaveButtonRect, "Save");
+
+        if (session.SaveMessageTimer > 0f && session.SaveMessage is { } message)
+            Raylib.DrawText(message, (int)SaveButtonRect.X, (int)(SaveButtonRect.Y + SaveButtonRect.Height + 4), 14, Color.DarkGreen);
+    }
+
+    static void Update(float dt, GameSession session, TileMap map, List<Actor> actors, SelectionState selection, SettingsMenuState settingsMenu,
         BuildMenuState buildMenu, WorkQueue workQueue, Inventory globalInventory, SunLight sun, ref Camera3D camera, ref Vector3 camTarget, ref float yaw, ref float pitch,
         ref float distance, ref bool showGrid, ref bool showPathDots)
     {
@@ -300,12 +478,16 @@ public static class Program
         // world clicks and stomp the selection.
         bool settingsConsumedClick = !armed && UpdateSettingsMenu(sun, settingsMenu, ref showGrid, ref showPathDots);
 
+        // Same story for the save button — a click on it shouldn't also
+        // clear whatever's currently selected.
+        bool saveConsumedClick = !armed && UpdateSaveButton(session);
+
         // Action-menu clicks are handled first and, if one lands, consumed —
         // otherwise clicking "Jump" would also register as a world click and
         // immediately clear the very selection you just acted on.
         bool menuConsumedClick = !armed && UpdateActionMenu(map, selection);
         UpdateSelection(actors, selection, camera, shiftHeld,
-            menuConsumedClick || settingsConsumedClick || buildConsumedClick || queueConsumedClick);
+            menuConsumedClick || settingsConsumedClick || buildConsumedClick || queueConsumedClick || saveConsumedClick);
         if (!armed) UpdateMoveOrders(map, selection, camera, workQueue);
 
         // Everyone seeks their own next waypoint independently — no per-tile
@@ -1132,7 +1314,7 @@ public static class Program
         return null; // no free tile anywhere — shouldn't happen in practice
     }
 
-    static void Draw(TileMap map, List<Actor> actors, SelectionState selection, SettingsMenuState settingsMenu,
+    static void Draw(GameSession session, TileMap map, List<Actor> actors, SelectionState selection, SettingsMenuState settingsMenu,
         BuildMenuState buildMenu, WorkQueue workQueue, Inventory globalInventory, Camera3D camera, SunLight sun, bool showGrid, bool showPathDots)
     {
         // Every campfire's point light, refreshed each frame (flicker means
@@ -1286,6 +1468,7 @@ public static class Program
         DrawSettingsMenu(sun, settingsMenu, showGrid, showPathDots);
         DrawBuildMenu(buildMenu);
         DrawTaskQueue(workQueue);
+        DrawSaveButton(session);
 
         // The action menu, only while something's selected.
         if (selection.Selected.Count > 0)

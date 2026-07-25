@@ -155,6 +155,20 @@ public sealed class WaterSim
     Touch(fx, fz);
   }
 
+  // Sets a column's depth outright rather than adding to it — used when
+  // restoring a saved map, where the loaded value already IS the absolute
+  // depth rather than a delta to apply.
+  public void SetDepth(int fx, int fz, float depth)
+  {
+    if (!InBounds(fx, fz)) return;
+    _depth[Idx(fx, fz)] = MathF.Max(0f, depth);
+    if (depth > 0f)
+    {
+      MarkChunkDirtyAt(fx, fz);
+      Touch(fx, fz);
+    }
+  }
+
   // Brings a column into the active region even though nothing about its
   // water changed. TileMap calls this after digging or depositing, so that
   // a channel cut just beyond the current wet area is simulated on the
