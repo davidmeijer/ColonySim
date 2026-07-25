@@ -132,6 +132,8 @@ public class SunLight
   // isn't dark the instant the game opens.
   float _time = 0.35f;
 
+  float _speedMultiplier = 1f;
+
   // Direction the light travels (sun/moon -> ground) — what the shader
   // needs. Recomputed every frame in Recompute().
   Vector3 _lightDir;
@@ -139,6 +141,33 @@ public class SunLight
 
   public Shader Shader => _shader;
   public Color SkyColor { get; private set; }
+
+  // While true, Update() leaves time of day exactly where it is — the sun
+  // (and its shadows) stop moving until this is cleared again.
+  public bool Frozen { get; set; }
+
+  // How many in-game "days" pass per real second, relative to the normal
+  // DayLengthSeconds pace. 1 = normal speed, 0 = effectively frozen, 2 =
+  // twice as fast. Clamped so a stray UI value can't send time backwards
+  // or into an absurdly fast spin.
+  public float SpeedMultiplier
+  {
+    get => _speedMultiplier;
+    set => _speedMultiplier = Math.Clamp(value, 0f, 10f);
+  }
+
+  // Normalised time of day (0 = midnight ... 1 = next midnight). Settable
+  // so a UI slider can jump straight to a moment — the cycle then keeps
+  // running from wherever it was dropped, unless Frozen is also set.
+  public float TimeOfDay
+  {
+    get => _time;
+    set
+    {
+      _time = ((value % 1f) + 1f) % 1f;
+      Recompute();
+    }
+  }
 
   // One point on the day/night gradient: how bright the sky/ground/light
   // itself look at some moment. Intensity separately scales how much the
@@ -234,7 +263,8 @@ public class SunLight
 
   public void Update(float dt)
   {
-    _time = (_time + dt / DayLengthSeconds) % 1f;
+    if (Frozen) return;
+    _time = (_time + dt * _speedMultiplier / DayLengthSeconds) % 1f;
     Recompute();
   }
 

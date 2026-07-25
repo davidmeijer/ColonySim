@@ -38,9 +38,38 @@ public static class Program
     static readonly Rectangle DigButtonRect = new(100, ScreenHeight - 66, 80, 28);
     static readonly Rectangle DepositButtonRect = new(190, ScreenHeight - 66, 100, 28);
 
-    // Top-right, independent of the selection-driven action menu — grid
-    // visibility isn't tied to having a pawn selected.
-    static readonly Rectangle GridButtonRect = new(ScreenWidth - 100, 10, 90, 28);
+    // Top-right gear icon, always visible, that opens/closes the settings
+    // panel below it. Everything in the panel (grid toggle, day/night
+    // freeze, time-of-day and speed sliders) is laid out relative to it.
+    static readonly Rectangle SettingsButtonRect = new(ScreenWidth - 46, 10, 36, 36);
+
+    const float PanelWidth = 260f;
+    const float PanelX = ScreenWidth - PanelWidth - 10f;
+    const float PanelY = 56f;
+    const float PanelHeight = 210f;
+
+    static readonly Rectangle SettingsPanelRect = new(PanelX, PanelY, PanelWidth, PanelHeight);
+    static readonly Rectangle GridButtonRect = new(PanelX + 14, PanelY + 34, 108, 28);
+    static readonly Rectangle FreezeButtonRect = new(PanelX + 138, PanelY + 34, 108, 28);
+
+    static readonly Rectangle TimeSliderTrack = new(PanelX + 14, PanelY + 100, PanelWidth - 28, 6);
+    static readonly Rectangle TimeSliderHitRect = new(TimeSliderTrack.X, TimeSliderTrack.Y - 10, TimeSliderTrack.Width, 26);
+
+    static readonly Rectangle SpeedSliderTrack = new(PanelX + 14, PanelY + 168, PanelWidth - 28, 6);
+    static readonly Rectangle SpeedSliderHitRect = new(SpeedSliderTrack.X, SpeedSliderTrack.Y - 10, SpeedSliderTrack.Width, 26);
+
+    const float MinSpeed = 0f;
+    const float MaxSpeed = 5f;
+
+    // State for the settings panel: whether it's open, and whether a slider
+    // inside it is currently being dragged (has to persist across frames,
+    // same reason SelectionState does).
+    class SettingsMenuState
+    {
+        public bool Open;
+        public bool DraggingTime;
+        public bool DraggingSpeed;
+    }
 
     public static void Main()
     {
@@ -57,6 +86,7 @@ public static class Program
         var pawns = spawnTiles.Select(t => new Pawn(map, t.X, t.Y)).ToList();
 
         var selection = new SelectionState();
+        var settingsMenu = new SettingsMenuState();
         bool showGrid = true;
 
         // A slowly-drifting directional light, so faces catch shading
@@ -91,11 +121,11 @@ public static class Program
             // movement by dt makes speeds frame-rate independent.
             float dt = Raylib.GetFrameTime();
 
-            Update(dt, map, pawns, selection, ref camera, ref camTarget, ref camYaw, ref camPitch, ref camDistance, ref showGrid);
+            Update(dt, map, pawns, selection, settingsMenu, sun, ref camera, ref camTarget, ref camYaw, ref camPitch, ref camDistance, ref showGrid);
             map.UpdateWater(dt);
             map.UpdateVegetation(dt);
             sun.Update(dt);
-            Draw(map, pawns, selection, camera, sun, showGrid);
+            Draw(map, pawns, selection, settingsMenu, camera, sun, showGrid);
         }
 
         sun.Unload();
@@ -103,8 +133,8 @@ public static class Program
         Raylib.CloseWindow();
     }
 
-    static void Update(float dt, TileMap map, List<Pawn> pawns, SelectionState selection, ref Camera3D camera,
-        ref Vector3 camTarget, ref float yaw, ref float pitch, ref float distance, ref bool showGrid)
+    static void Update(float dt, TileMap map, List<Pawn> pawns, SelectionState selection, SettingsMenuState settingsMenu,
+        SunLight sun, ref Camera3D camera, ref Vector3 camTarget, ref float yaw, ref float pitch, ref float distance, ref bool showGrid)
     {
         // --- Zoom with the mouse wheel, clamped to a sane range ---
         float wheel = Raylib.GetMouseWheelMove();
@@ -151,17 +181,17 @@ public static class Program
 
         bool shiftHeld = Raylib.IsKeyDown(KeyboardKey.LeftShift) || Raylib.IsKeyDown(KeyboardKey.RightShift);
 
-        // The grid toggle lives outside the selection-driven action menu (it
-        // has to work with nothing selected), but its click still needs
-        // consuming for the same reason: otherwise it'd also register as a
-        // world click and stomp the selection.
-        bool gridConsumedClick = UpdateGridToggle(ref showGrid);
+        // The settings panel lives outside the selection-driven action menu
+        // (it has to work with nothing selected), but its clicks still need
+        // consuming for the same reason: otherwise they'd also register as
+        // world clicks and stomp the selection.
+        bool settingsConsumedClick = UpdateSettingsMenu(sun, settingsMenu, ref showGrid);
 
         // Action-menu clicks are handled first and, if one lands, consumed —
         // otherwise clicking "Jump" would also register as a world click and
         // immediately clear the very selection you just acted on.
         bool menuConsumedClick = UpdateActionMenu(map, selection);
-        UpdateSelection(pawns, selection, camera, shiftHeld, menuConsumedClick || gridConsumedClick);
+        UpdateSelection(pawns, selection, camera, shiftHeld, menuConsumedClick || settingsConsumedClick);
         UpdateMoveOrders(map, pawns, selection, camera);
 
         // Everyone seeks their own next waypoint independently — no per-tile
@@ -223,15 +253,72 @@ public static class Program
         }
     }
 
-    // Flips the coarse 10x10 grid overlay on/off. Always live, unlike the
-    // action menu, since it isn't tied to having a pawn selected.
-    static bool UpdateGridToggle(ref bool showGrid)
+    // The gear icon toggles the panel; everything else here only reacts
+    // while it's open. Returns true whenever a click landed on the gear
+    // icon or somewhere inside the open panel, so that same click doesn't
+    // also fall through to world/pawn selection. A click that closes the
+    // panel by landing *outside* it is deliberately NOT consumed, so it
+    // still acts as a normal world click (e.g. clearing selection).
+    static bool UpdateSettingsMenu(SunLight sun, SettingsMenuState menu, ref bool showGrid)
     {
-        if (!Raylib.IsMouseButtonPressed(MouseButton.Left)) return false;
-        if (!Raylib.CheckCollisionPointRec(Raylib.GetMousePosition(), GridButtonRect)) return false;
+        Vector2 mouse = Raylib.GetMousePosition();
+        bool leftPressed = Raylib.IsMouseButtonPressed(MouseButton.Left);
 
-        showGrid = !showGrid;
-        return true;
+        if (leftPressed && Raylib.CheckCollisionPointRec(mouse, SettingsButtonRect))
+        {
+            menu.Open = !menu.Open;
+            return true;
+        }
+
+        if (!menu.Open) return false;
+
+        if (leftPressed)
+        {
+            if (Raylib.CheckCollisionPointRec(mouse, GridButtonRect))
+            {
+                showGrid = !showGrid;
+                return true;
+            }
+
+            if (Raylib.CheckCollisionPointRec(mouse, FreezeButtonRect))
+            {
+                sun.Frozen = !sun.Frozen;
+                return true;
+            }
+
+            if (Raylib.CheckCollisionPointRec(mouse, TimeSliderHitRect)) menu.DraggingTime = true;
+            if (Raylib.CheckCollisionPointRec(mouse, SpeedSliderHitRect)) menu.DraggingSpeed = true;
+        }
+
+        if (Raylib.IsMouseButtonReleased(MouseButton.Left))
+        {
+            menu.DraggingTime = false;
+            menu.DraggingSpeed = false;
+        }
+
+        if (menu.DraggingTime)
+        {
+            float t = Math.Clamp((mouse.X - TimeSliderTrack.X) / TimeSliderTrack.Width, 0f, 1f);
+            sun.TimeOfDay = t;
+        }
+
+        if (menu.DraggingSpeed)
+        {
+            float t = Math.Clamp((mouse.X - SpeedSliderTrack.X) / SpeedSliderTrack.Width, 0f, 1f);
+            sun.SpeedMultiplier = MinSpeed + t * (MaxSpeed - MinSpeed);
+        }
+
+        if (menu.DraggingTime || menu.DraggingSpeed) return true;
+
+        // A click anywhere else inside the panel (its background, or the
+        // gap between controls) still shouldn't leak through to the world.
+        if (leftPressed && Raylib.CheckCollisionPointRec(mouse, SettingsPanelRect)) return true;
+
+        // A click outside the panel while it's open closes it, but is left
+        // unconsumed so it behaves like the ordinary world click it looks like.
+        if (leftPressed) menu.Open = false;
+
+        return false;
     }
 
     // The action menu only does anything once at least one pawn is selected.
@@ -485,7 +572,7 @@ public static class Program
         return null; // no free tile anywhere — shouldn't happen in practice
     }
 
-    static void Draw(TileMap map, List<Pawn> pawns, SelectionState selection, Camera3D camera, SunLight sun, bool showGrid)
+    static void Draw(TileMap map, List<Pawn> pawns, SelectionState selection, SettingsMenuState settingsMenu, Camera3D camera, SunLight sun, bool showGrid)
     {
         // Rendered from the light's point of view into its own depth
         // texture before anything else — the main lit pass right below
@@ -515,7 +602,7 @@ public static class Program
         // Unlit pass: faint edges on every block so height steps are legible
         // even where the shading alone doesn't make it obvious, plus each
         // pawn's outline and selection ring. The grid itself is optional —
-        // toggled by the top-right button — everything else here isn't.
+        // toggled from the settings panel — everything else here isn't.
         if (showGrid) map.DrawOutlines();
         foreach (var pawn in pawns) pawn.DrawOutline();
 
@@ -533,13 +620,9 @@ public static class Program
         }
 
         // The HUD is drawn in *screen* space, so it stays put.
-        Raylib.DrawText(
-            "WASD: pan   Q/E: rotate   R/F: tilt   wheel: zoom   " +
-            "left-click/drag/shift: select   right-click: move selected",
-            10, 10, 18, Color.Black);
-        Raylib.DrawText($"Selected: {selection.Selected.Count}/{pawns.Count}", 10, 32, 18, Color.Black);
+        Raylib.DrawText($"Selected: {selection.Selected.Count}/{pawns.Count}", 10, 10, 18, Color.Black);
 
-        DrawButton(GridButtonRect, "Grid", active: showGrid);
+        DrawSettingsMenu(sun, settingsMenu, showGrid);
 
         // The action menu, only while something's selected.
         if (selection.Selected.Count > 0)
@@ -580,5 +663,76 @@ public static class Program
 
         int textWidth = Raylib.MeasureText(label, 16);
         Raylib.DrawText(label, (int)(rect.X + (rect.Width - textWidth) / 2f), (int)(rect.Y + 7), 16, Color.Black);
+    }
+
+    // The gear icon plus, when open, the panel of controls below it: grid
+    // on/off, freezing the day/night cycle in place, and sliders for
+    // jumping to a time of day and for how fast the cycle runs.
+    static void DrawSettingsMenu(SunLight sun, SettingsMenuState menu, bool showGrid)
+    {
+        DrawGearButton(SettingsButtonRect, menu.Open);
+        if (!menu.Open) return;
+
+        Raylib.DrawRectangleRec(SettingsPanelRect, new Color(245, 245, 245, 235));
+        Raylib.DrawRectangleLinesEx(SettingsPanelRect, 1.5f, Color.DarkGray);
+        Raylib.DrawText("Settings", (int)PanelX + 14, (int)PanelY + 8, 18, Color.Black);
+
+        DrawButton(GridButtonRect, "Grid", active: showGrid);
+        DrawButton(FreezeButtonRect, sun.Frozen ? "Frozen" : "Freeze", active: sun.Frozen);
+
+        DrawSlider(TimeSliderTrack, $"Time of day: {FormatTimeOfDay(sun.TimeOfDay)}", sun.TimeOfDay, 0f, 1f);
+        DrawSlider(SpeedSliderTrack, $"Speed: {sun.SpeedMultiplier:0.0}x", sun.SpeedMultiplier, MinSpeed, MaxSpeed);
+    }
+
+    // A gear-shaped icon button: a ring of teeth around a circular hub,
+    // drawn with plain rotated rectangles rather than a texture asset.
+    // "active" (the panel being open) darkens it the same way DrawButton's
+    // active toggles do.
+    static void DrawGearButton(Rectangle rect, bool active)
+    {
+        bool hovered = Raylib.CheckCollisionPointRec(Raylib.GetMousePosition(), rect);
+        Color fill = active
+            ? (hovered ? new Color(90, 160, 90, 255) : new Color(120, 190, 120, 255))
+            : (hovered ? new Color(140, 200, 140, 255) : new Color(200, 230, 200, 255));
+        Raylib.DrawRectangleRec(rect, fill);
+        Raylib.DrawRectangleLinesEx(rect, 1.5f, Color.DarkGreen);
+
+        Vector2 center = new(rect.X + rect.Width / 2f, rect.Y + rect.Height / 2f);
+        float outerR = MathF.Min(rect.Width, rect.Height) * 0.26f;
+        float innerR = outerR * 0.5f;
+        float toothLen = outerR * 0.55f;
+        float toothWidth = outerR * 0.55f;
+
+        for (int i = 0; i < 8; i++)
+        {
+            var tooth = new Rectangle(center.X, center.Y, toothWidth, outerR + toothLen);
+            Raylib.DrawRectanglePro(tooth, new Vector2(toothWidth / 2f, outerR + toothLen), i * 45f, Color.DarkGreen);
+        }
+        Raylib.DrawCircleV(center, outerR, Color.DarkGreen);
+        Raylib.DrawCircleV(center, innerR, fill);
+    }
+
+    // A labelled horizontal slider: a filled track up to the current value
+    // plus a knob, matching the panel's own light/dark-green button styling.
+    static void DrawSlider(Rectangle track, string label, float value, float min, float max)
+    {
+        Raylib.DrawText(label, (int)track.X, (int)track.Y - 20, 16, Color.Black);
+
+        Raylib.DrawRectangleRec(track, new Color(210, 210, 210, 255));
+        Raylib.DrawRectangleLinesEx(track, 1f, Color.DarkGray);
+
+        float t = Math.Clamp((value - min) / (max - min), 0f, 1f);
+        float knobX = track.X + t * track.Width;
+        Raylib.DrawRectangle((int)track.X, (int)track.Y, (int)(t * track.Width), (int)track.Height, new Color(120, 190, 120, 255));
+        Raylib.DrawCircle((int)knobX, (int)(track.Y + track.Height / 2f), 8f, Color.DarkGreen);
+    }
+
+    // Renders a 0..1 time-of-day fraction as a 24-hour clock string.
+    static string FormatTimeOfDay(float t)
+    {
+        float hoursFloat = ((t % 1f) + 1f) % 1f * 24f;
+        int hours = (int)hoursFloat;
+        int minutes = (int)((hoursFloat - hours) * 60f);
+        return $"{hours:00}:{minutes:00}";
     }
 }
