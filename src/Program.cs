@@ -39,23 +39,25 @@ public static class Program
     static readonly Rectangle DepositButtonRect = new(190, ScreenHeight - 66, 100, 28);
 
     // Top-right gear icon, always visible, that opens/closes the settings
-    // panel below it. Everything in the panel (grid toggle, day/night
-    // freeze, time-of-day and speed sliders) is laid out relative to it.
+    // panel below it. Everything in the panel (grid toggle, path-dots
+    // toggle, day/night freeze, time-of-day and speed sliders) is laid out
+    // relative to it.
     static readonly Rectangle SettingsButtonRect = new(ScreenWidth - 46, 10, 36, 36);
 
     const float PanelWidth = 260f;
     const float PanelX = ScreenWidth - PanelWidth - 10f;
     const float PanelY = 56f;
-    const float PanelHeight = 210f;
+    const float PanelHeight = 230f;
 
     static readonly Rectangle SettingsPanelRect = new(PanelX, PanelY, PanelWidth, PanelHeight);
     static readonly Rectangle GridButtonRect = new(PanelX + 14, PanelY + 34, 108, 28);
     static readonly Rectangle FreezeButtonRect = new(PanelX + 138, PanelY + 34, 108, 28);
+    static readonly Rectangle PathDotsButtonRect = new(PanelX + 14, PanelY + 70, PanelWidth - 28, 28);
 
-    static readonly Rectangle TimeSliderTrack = new(PanelX + 14, PanelY + 100, PanelWidth - 28, 6);
+    static readonly Rectangle TimeSliderTrack = new(PanelX + 14, PanelY + 134, PanelWidth - 28, 6);
     static readonly Rectangle TimeSliderHitRect = new(TimeSliderTrack.X, TimeSliderTrack.Y - 10, TimeSliderTrack.Width, 26);
 
-    static readonly Rectangle SpeedSliderTrack = new(PanelX + 14, PanelY + 168, PanelWidth - 28, 6);
+    static readonly Rectangle SpeedSliderTrack = new(PanelX + 14, PanelY + 202, PanelWidth - 28, 6);
     static readonly Rectangle SpeedSliderHitRect = new(SpeedSliderTrack.X, SpeedSliderTrack.Y - 10, SpeedSliderTrack.Width, 26);
 
     const float MinSpeed = 0f;
@@ -112,7 +114,8 @@ public static class Program
         var selection = new SelectionState();
         var settingsMenu = new SettingsMenuState();
         var buildMenu = new BuildMenuState();
-        bool showGrid = true;
+        bool showGrid = false;
+        bool showPathDots = false;
 
         // A slowly-drifting directional light, so faces catch shading
         // depending on which way they point — that plus TileMap's block
@@ -146,11 +149,11 @@ public static class Program
             // movement by dt makes speeds frame-rate independent.
             float dt = Raylib.GetFrameTime();
 
-            Update(dt, map, actors, selection, settingsMenu, buildMenu, sun, ref camera, ref camTarget, ref camYaw, ref camPitch, ref camDistance, ref showGrid);
+            Update(dt, map, actors, selection, settingsMenu, buildMenu, sun, ref camera, ref camTarget, ref camYaw, ref camPitch, ref camDistance, ref showGrid, ref showPathDots);
             map.UpdateWater(dt);
             map.UpdateVegetation(dt);
             sun.Update(dt);
-            Draw(map, actors, selection, settingsMenu, buildMenu, camera, sun, showGrid);
+            Draw(map, actors, selection, settingsMenu, buildMenu, camera, sun, showGrid, showPathDots);
         }
 
         sun.Unload();
@@ -160,7 +163,7 @@ public static class Program
 
     static void Update(float dt, TileMap map, List<Actor> actors, SelectionState selection, SettingsMenuState settingsMenu,
         BuildMenuState buildMenu, SunLight sun, ref Camera3D camera, ref Vector3 camTarget, ref float yaw, ref float pitch,
-        ref float distance, ref bool showGrid)
+        ref float distance, ref bool showGrid, ref bool showPathDots)
     {
         // --- Zoom with the mouse wheel, clamped to a sane range ---
         float wheel = Raylib.GetMouseWheelMove();
@@ -219,7 +222,7 @@ public static class Program
         // (it has to work with nothing selected), but its clicks still need
         // consuming for the same reason: otherwise they'd also register as
         // world clicks and stomp the selection.
-        bool settingsConsumedClick = !buildMenu.Placing && UpdateSettingsMenu(sun, settingsMenu, ref showGrid);
+        bool settingsConsumedClick = !buildMenu.Placing && UpdateSettingsMenu(sun, settingsMenu, ref showGrid, ref showPathDots);
 
         // Action-menu clicks are handled first and, if one lands, consumed —
         // otherwise clicking "Jump" would also register as a world click and
@@ -343,7 +346,7 @@ public static class Program
     // also fall through to world/actor selection. A click that closes the
     // panel by landing *outside* it is deliberately NOT consumed, so it
     // still acts as a normal world click (e.g. clearing selection).
-    static bool UpdateSettingsMenu(SunLight sun, SettingsMenuState menu, ref bool showGrid)
+    static bool UpdateSettingsMenu(SunLight sun, SettingsMenuState menu, ref bool showGrid, ref bool showPathDots)
     {
         Vector2 mouse = Raylib.GetMousePosition();
         bool leftPressed = Raylib.IsMouseButtonPressed(MouseButton.Left);
@@ -367,6 +370,12 @@ public static class Program
             if (Raylib.CheckCollisionPointRec(mouse, FreezeButtonRect))
             {
                 sun.Frozen = !sun.Frozen;
+                return true;
+            }
+
+            if (Raylib.CheckCollisionPointRec(mouse, PathDotsButtonRect))
+            {
+                showPathDots = !showPathDots;
                 return true;
             }
 
@@ -752,7 +761,7 @@ public static class Program
     }
 
     static void Draw(TileMap map, List<Actor> actors, SelectionState selection, SettingsMenuState settingsMenu,
-        BuildMenuState buildMenu, Camera3D camera, SunLight sun, bool showGrid)
+        BuildMenuState buildMenu, Camera3D camera, SunLight sun, bool showGrid, bool showPathDots)
     {
         // Every campfire's point light, refreshed each frame (flicker means
         // even a stationary fire's colour keeps changing) — has to happen
@@ -794,7 +803,7 @@ public static class Program
         map.DrawBushes();
         map.DrawCampfiresLit();
         map.DrawWater();
-        foreach (var actor in actors) actor.DrawSolid();
+        foreach (var actor in actors) actor.DrawSolid(showPathDots);
         sun.EndLit();
 
         // Unlit pass: faint edges on every block so height steps are legible
@@ -834,7 +843,7 @@ public static class Program
         // The HUD is drawn in *screen* space, so it stays put.
         Raylib.DrawText($"Selected: {selection.Selected.Count}/{actors.Count}", 10, 10, 18, Color.Black);
 
-        DrawSettingsMenu(sun, settingsMenu, showGrid);
+        DrawSettingsMenu(sun, settingsMenu, showGrid, showPathDots);
         DrawBuildMenu(buildMenu);
 
         // The action menu, only while something's selected.
@@ -879,9 +888,10 @@ public static class Program
     }
 
     // The gear icon plus, when open, the panel of controls below it: grid
-    // on/off, freezing the day/night cycle in place, and sliders for
-    // jumping to a time of day and for how fast the cycle runs.
-    static void DrawSettingsMenu(SunLight sun, SettingsMenuState menu, bool showGrid)
+    // on/off, actor path-dots on/off, freezing the day/night cycle in
+    // place, and sliders for jumping to a time of day and for how fast the
+    // cycle runs.
+    static void DrawSettingsMenu(SunLight sun, SettingsMenuState menu, bool showGrid, bool showPathDots)
     {
         DrawGearButton(SettingsButtonRect, menu.Open);
         if (!menu.Open) return;
@@ -892,6 +902,7 @@ public static class Program
 
         DrawButton(GridButtonRect, "Grid", active: showGrid);
         DrawButton(FreezeButtonRect, sun.Frozen ? "Frozen" : "Freeze", active: sun.Frozen);
+        DrawButton(PathDotsButtonRect, "Path Dots", active: showPathDots);
 
         DrawSlider(TimeSliderTrack, $"Time of day: {FormatTimeOfDay(sun.TimeOfDay)}", sun.TimeOfDay, 0f, 1f);
         DrawSlider(SpeedSliderTrack, $"Speed: {sun.SpeedMultiplier:0.0}x", sun.SpeedMultiplier, MinSpeed, MaxSpeed);

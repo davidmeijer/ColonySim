@@ -514,13 +514,18 @@ public class Actor
   // shader (see SunLight) deliberately skips a model-matrix transform and
   // expects fragPosition/fragNormal to already be world space, which only
   // holds if the rotation is baked into the vertices themselves.
-  public void DrawSolid()
+  public void DrawSolid(bool showPathDots)
   {
-    // Draw the remaining path as small dots so you can see the plan.
-    foreach (var (x, y) in _path)
+    // Draw the remaining path as small dots so you can see the plan —
+    // optional (off by default): with several actors all mid-route, the
+    // dots add up to a fair bit of visual noise.
+    if (showPathDots)
     {
-      Vector3 top = TileTop(x, y);
-      Raylib.DrawSphere(new Vector3(top.X, top.Y + 2f, top.Z), 3f, Color.Yellow);
+      foreach (var (x, y) in _path)
+      {
+        Vector3 top = TileTop(x, y);
+        Raylib.DrawSphere(new Vector3(top.X, top.Y + 2f, top.Z), 3f, Color.Yellow);
+      }
     }
 
     Matrix4x4 headingRot = Matrix4x4.CreateRotationY(_heading);
