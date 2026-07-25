@@ -4,19 +4,16 @@ namespace ColonySim.Pathfinding;
 
 public static class AStar
 {
-    // isBlocked marks tiles the map alone doesn't know about — chiefly actors
-    // standing still with nowhere left to go, which should be routed around
-    // just like rock. Actors that are still walking are left out of this: a
-    // path in progress is expected to clear out of the way (or the mover
-    // waits at worst), so only idle actors count as fixed obstacles.
-    public static List<(int X, int Y)> FindPath(TileMap map, int startX, int startY, int goalX, int goalY,
-        Func<int, int, bool>? isBlocked = null)
+    // Actors never block pathfinding for one another (see Program.cs's
+    // ResolveOverlaps for how a crowd still avoids fully overlapping) — the
+    // only obstacles a route has to route around are ones the map itself
+    // knows about (rock, deep water, trees/bushes/campfires, too-steep steps).
+    public static List<(int X, int Y)> FindPath(TileMap map, int startX, int startY, int goalX, int goalY)
     {
         var result = new List<(int X, int Y)>();
-        isBlocked ??= static (_, _) => false;
 
         // Can't path onto a blocked goal.
-        if (!map.IsWalkable(goalX, goalY) || isBlocked(goalX, goalY)) return result;
+        if (!map.IsWalkable(goalX, goalY)) return result;
 
         var start = (startX, startY);
         var goal = (goalX, goalY);
@@ -55,7 +52,6 @@ public static class AStar
                 // neighbour more than half a block higher isn't a valid step
                 // even though it's perfectly walkable ground on its own.
                 if (!map.CanStep(current.Item1, current.Item2, neighbour.Item1, neighbour.Item2)) continue;
-                if (isBlocked(neighbour.Item1, neighbour.Item2)) continue;
 
                 int tentative = gScore[current] + 1; // each step costs 1
 

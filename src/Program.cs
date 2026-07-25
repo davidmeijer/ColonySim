@@ -299,7 +299,7 @@ public static class Program
         bool menuConsumedClick = !armed && UpdateActionMenu(map, selection);
         UpdateSelection(actors, selection, camera, shiftHeld,
             menuConsumedClick || settingsConsumedClick || buildConsumedClick || queueConsumedClick);
-        if (!armed) UpdateMoveOrders(map, actors, selection, camera, workQueue);
+        if (!armed) UpdateMoveOrders(map, selection, camera, workQueue);
 
         // Everyone seeks their own next waypoint independently — no per-tile
         // locking — then overlaps get shoved apart, then anyone who's made
@@ -346,18 +346,17 @@ public static class Program
     }
 
     // Anyone who's been stuck for too long (see Actor.Stuck) gets a brand new
-    // route to the same final destination, re-checking blocking actors right
-    // now. Uses Reroute (not SetPath) so repeated failures still count
-    // toward Actor's own give-up timeout instead of resetting it every try.
-    // If no route exists any more, this just leaves them stopped where they are.
+    // route to the same final destination. Uses Reroute (not SetPath) so
+    // repeated failures still count toward Actor's own give-up timeout
+    // instead of resetting it every try. If no route exists any more, this
+    // just leaves them stopped where they are.
     static void RepathStuckActors(TileMap map, List<Actor> actors)
     {
         foreach (var actor in actors)
         {
             if (!actor.Stuck || actor.FinalDestination is not { } dest) continue;
 
-            var blockingTiles = BlockingTiles(actors, except: actor);
-            var path = AStar.FindPath(map, actor.TileX, actor.TileZ, dest.X, dest.Y, PathBlocker(blockingTiles, actor));
+            var path = AStar.FindPath(map, actor.TileX, actor.TileZ, dest.X, dest.Y);
             actor.Reroute(path);
         }
     }
@@ -395,7 +394,7 @@ public static class Program
             var task = workQueue.Tasks.FirstOrDefault(t => t.Worker == actor);
             if (task == null)
             {
-                if (!actor.IsMoving) TryAssignTask(map, actors, workQueue, globalInventory, actor);
+                if (!actor.IsMoving) TryAssignTask(map, workQueue, globalInventory, actor);
                 continue;
             }
 
@@ -432,14 +431,24 @@ public static class Program
     // task this actor can actually path to, claims it, and sends it on its
     // way — same AStar/SetPath plumbing as a manual move order. Leaves the
     // actor idle for this frame if nothing qualifies.
-    static void TryAssignTask(TileMap map, List<Actor> actors, WorkQueue workQueue, Inventory globalInventory, Actor actor)
+    static void TryAssignTask(TileMap map, WorkQueue workQueue, Inventory globalInventory, Actor actor)
     {
-        var blockingTiles = BlockingTiles(actors, except: actor);
+        // Actors don't block each other's movement any more, but a work
+        // stand tile is a fixed exact point (the tile's centre) two
+        // builders would otherwise walk straight on top of each other to
+        // reach — each endlessly re-approaching the same spot ResolveOverlaps
+        // just shoved them off of. So this one exception still applies:
+        // never send two actors to work the same tile at the same time.
+        var takenStandTiles = workQueue.Tasks
+            .Where(t => t.Worker != null && t.Worker != actor)
+            .Select(t => (t.StandX, t.StandZ))
+            .ToHashSet();
 
         foreach (var candidate in workQueue.ClaimableInOrder(map, globalInventory))
         {
-            var path = AStar.FindPath(map, actor.TileX, actor.TileZ, candidate.StandX, candidate.StandZ,
-                PathBlocker(blockingTiles, actor));
+            if (takenStandTiles.Contains((candidate.StandX, candidate.StandZ))) continue;
+
+            var path = AStar.FindPath(map, actor.TileX, actor.TileZ, candidate.StandX, candidate.StandZ);
             if (path.Count == 0) continue;
 
             candidate.Worker = actor;
@@ -547,8 +556,7 @@ public static class Program
                 continue;
             }
 
-            var blockingTiles = BlockingTiles(actors, except: actor);
-            var path = AStar.FindPath(map, actor.TileX, actor.TileZ, target.X, target.Z, PathBlocker(blockingTiles, actor));
+            var path = AStar.FindPath(map, actor.TileX, actor.TileZ, target.X, target.Z);
             actor.SetPath(path);
         }
     }
@@ -753,7 +761,7 @@ public static class Program
 
     // Right-click (a click, not a camera-orbit drag): send every selected
     // actor toward the clicked tile, each to its own nearby free spot.
-    static void UpdateMoveOrders(TileMap map, List<Actor> actors, SelectionState selection, Camera3D camera, WorkQueue workQueue)
+    static void UpdateMoveOrders(TileMap map, SelectionState selection, Camera3D camera, WorkQueue workQueue)
     {
         if (Raylib.IsMouseButtonPressed(MouseButton.Right))
         {
@@ -777,12 +785,10 @@ public static class Program
                 // doing before, including a give-up — SetPath (not
                 // Reroute) resets its stuck budget for the new attempt.
                 var movers = selection.Selected.ToList();
-                var blockingTiles = BlockingTiles(actors);
-                var destinations = AssignDestinations(map, movers, hitX, hitZ, blockingTiles);
+                var destinations = AssignDestinations(map, movers, hitX, hitZ);
                 foreach (var (actor, dest) in destinations)
                 {
-                    var path = AStar.FindPath(map, actor.TileX, actor.TileZ, dest.X, dest.Z,
-                        PathBlocker(blockingTiles, actor));
+                    var path = AStar.FindPath(map, actor.TileX, actor.TileZ, dest.X, dest.Z);
 
                     // A manual order always wins over whatever work-queue
                     // assignment this actor was mid-way through — release it
@@ -1053,34 +1059,22 @@ public static class Program
         return null;
     }
 
-    // Tiles that should be routed around like solid rock: actors standing
-    // still with no route, AND actors currently Stuck (moving in name only —
-    // they haven't actually gone anywhere in a while). Without including
-    // Stuck actors here, a fresh route (manual or automatic) could plan
-    // straight back through the exact jam it's trying to get out of, which
-    // made it look like re-ordering a stuck actor did nothing. Actors making
-    // real progress are left out; they're expected to be elsewhere by the
-    // time anyone else gets there.
-    static HashSet<(int X, int Z)> BlockingTiles(List<Actor> actors, Actor? except = null) =>
-        actors.Where(p => p != except && (!p.IsMoving || p.Stuck)).Select(p => (p.TileX, p.TileZ)).ToHashSet();
-
-    // True for a tile standing in for solid ground: occupied by some OTHER
-    // blocking actor. An actor is never blocked by its own current tile.
-    static Func<int, int, bool> PathBlocker(HashSet<(int X, int Z)> blockingTiles, Actor mover) =>
-        (x, z) => blockingTiles.Contains((x, z)) && (x, z) != (mover.TileX, mover.TileZ);
-
     // Gives each mover its own nearby walkable tile around the target, so a
     // group order doesn't send everyone to stack on the exact same spot.
-    // Closer actors claim the closer slots first.
+    // Closer actors claim the closer slots first. Actors no longer block
+    // each other's paths or destinations (see ResolveOverlaps for how a
+    // crowd still avoids fully overlapping) — "claimed" here is only about
+    // this one order not sending two of its own movers to the same tile,
+    // not about staying off tiles other actors happen to occupy.
     static Dictionary<Actor, (int X, int Z)> AssignDestinations(
-        TileMap map, List<Actor> movers, int targetX, int targetZ, HashSet<(int X, int Z)> blockingTiles)
+        TileMap map, List<Actor> movers, int targetX, int targetZ)
     {
         var claimed = new HashSet<(int, int)>();
         var result = new Dictionary<Actor, (int, int)>();
 
         foreach (var actor in movers.OrderBy(p => Math.Abs(p.TileX - targetX) + Math.Abs(p.TileZ - targetZ)))
         {
-            var tile = FindNearestFreeTile(map, targetX, targetZ, claimed, PathBlocker(blockingTiles, actor));
+            var tile = FindNearestFreeTile(map, targetX, targetZ, claimed);
             if (tile is { } t)
             {
                 claimed.Add(t);
@@ -1091,12 +1085,10 @@ public static class Program
     }
 
     // Spirals outward ring by ring from (cx, cz) until it finds a walkable
-    // tile nobody else in this order has claimed, and no idle actor is
-    // already standing on.
-    static (int X, int Z)? FindNearestFreeTile(
-        TileMap map, int cx, int cz, HashSet<(int, int)> claimed, Func<int, int, bool> blocked)
+    // tile nobody else in this order has claimed.
+    static (int X, int Z)? FindNearestFreeTile(TileMap map, int cx, int cz, HashSet<(int, int)> claimed)
     {
-        if (map.IsWalkable(cx, cz) && !claimed.Contains((cx, cz)) && !blocked(cx, cz)) return (cx, cz);
+        if (map.IsWalkable(cx, cz) && !claimed.Contains((cx, cz))) return (cx, cz);
 
         int maxRadius = Math.Max(map.Width, map.Depth);
         for (int radius = 1; radius <= maxRadius; radius++)
@@ -1109,7 +1101,6 @@ public static class Program
                     int x = cx + dx, z = cz + dz;
                     if (!map.IsWalkable(x, z)) continue;
                     if (claimed.Contains((x, z))) continue;
-                    if (blocked(x, z)) continue;
                     return (x, z);
                 }
             }
