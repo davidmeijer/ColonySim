@@ -72,6 +72,37 @@ public class Actor
   const float JumpDuration = 0.45f;
   const float JumpHeight = TileMap.TileSize * 0.8f;
 
+  // --- Idle wandering ---------------------------------------------------
+  // How long since this actor was last given ANY path — a real order, an
+  // auto-reroute, or a previous wander — reset in ApplyPath so it covers
+  // all three uniformly. Once it clears a randomised threshold (rerolled
+  // every time it's reset, so a group doesn't all set off in lockstep)
+  // while genuinely idle, Program.cs sends it ambling a few tiles in a
+  // random direction — see WantsToWander/DeferWander.
+  float _idleTimer;
+  float _wanderDelayTarget = NextWanderDelay();
+  const float MinWanderDelay = 3f;
+  const float MaxWanderDelay = 9f;
+
+  static float NextWanderDelay() => MinWanderDelay + Random.Shared.NextSingle() * (MaxWanderDelay - MinWanderDelay);
+
+  // True once an actor with nothing else going on (no path at all — not a
+  // real order, not mid-wander already) has sat idle past its threshold.
+  // Program.cs is the one that actually knows how to find a walkable tile
+  // and path to it, so this just flags "ready", it doesn't act on it.
+  public bool WantsToWander => _path.Count == 0 && _idleTimer >= _wanderDelayTarget;
+
+  // Called instead of SetPath when a wander attempt couldn't find anywhere
+  // to send this actor this time (e.g. boxed in) — waits out another full
+  // idle spell before trying again, rather than retrying every frame.
+  public void DeferWander() => ResetIdleTimer();
+
+  void ResetIdleTimer()
+  {
+    _idleTimer = 0f;
+    _wanderDelayTarget = NextWanderDelay();
+  }
+
   // --- Body layout -----------------------------------------------------
   // A small blocky humanoid built from six boxes (torso, head, two legs,
   // two arms), proportioned relative to TileSize so an actor reads as
@@ -132,6 +163,14 @@ public class Actor
   const float WalkBlendRate = 10f;
   const float JumpLegTuckDeg = 25f;
 
+  // A slow, free-running rise and fall of the chest — always on, walking
+  // or not, same as a real person keeps breathing while they walk. Purely
+  // a couple of world units of torso height, not gated behind any other
+  // state, so it never has to coordinate with the walk cycle, digging, etc.
+  float _breathPhase;
+  const float BreathRate = 1.6f; // radians of phase per second
+  const float BreathAmount = HeadSize * 0.16f; // peak-to-peak torso height change
+
   bool _digging;
   float _digTimer;
   const float DigDuration = 0.5f;
@@ -146,7 +185,7 @@ public class Actor
 
   // Cached per-frame pose, computed once in Update() and read by all three
   // Draw* methods so they agree on where the limbs are this frame.
-  float _poseLeftLegDeg, _poseRightLegDeg, _poseLeftArmDeg, _poseRightArmDeg, _poseTorsoLeanDeg;
+  float _poseLeftLegDeg, _poseRightLegDeg, _poseLeftArmDeg, _poseRightArmDeg, _poseTorsoLeanDeg, _poseBreathLift;
 
   public Actor(TileMap map, int tileX, int tileZ)
   {
@@ -193,6 +232,7 @@ public class Actor
 
     FinalDestination = _path.Count > 0 ? path[^1] : null;
     ResetProgress();
+    ResetIdleTimer();
   }
 
   void ResetProgress()
@@ -229,6 +269,7 @@ public class Actor
     {
       ResetProgress();
       _totalStuckTime = 0f;
+      _idleTimer += dt;
     }
     else
     {
@@ -372,6 +413,9 @@ public class Actor
     _walkBlend += (walkTarget - _walkBlend) * Math.Clamp(dt * WalkBlendRate, 0f, 1f);
     if (movingThisFrame) _walkPhase += dt * WalkCycleRate;
 
+    _breathPhase += dt * BreathRate;
+    _poseBreathLift = MathF.Sin(_breathPhase) * (BreathAmount / 2f);
+
     float swing = MathF.Sin(_walkPhase) * WalkSwingDeg * _walkBlend;
     float jumpTuck = _jumping
       ? MathF.Sin(Math.Clamp(_jumpTimer / JumpDuration, 0f, 1f) * MathF.PI) * JumpLegTuckDeg
@@ -418,18 +462,27 @@ public class Actor
 
   IEnumerable<BodyPart> BuildParts()
   {
-    yield return new BodyPart(
-      new Vector3(0, LegHeight + TorsoHeight / 2f, 0), Vector3.Zero, _poseTorsoLeanDeg,
-      new Vector3(TorsoWidth, TorsoHeight, TorsoDepth), _shirtColor);
+    // Breathing changes the torso's own height slightly, growing/shrinking
+    // upward only — the bottom (waist, where the legs attach) always stays
+    // exactly at LegHeight, so it reads as a chest rising and falling
+    // rather than the whole torso sliding up and down. Shoulders, the
+    // head, and the eyes all key off torsoTop instead of the raw
+    // LegHeight + TorsoHeight, so they ride along with each breath too.
+    float torsoHeight = TorsoHeight + _poseBreathLift;
+    float torsoTop = LegHeight + torsoHeight;
 
     yield return new BodyPart(
-      new Vector3(0, LegHeight + TorsoHeight + HeadSize / 2f, 0), Vector3.Zero, 0f,
+      new Vector3(0, LegHeight + torsoHeight / 2f, 0), Vector3.Zero, _poseTorsoLeanDeg,
+      new Vector3(TorsoWidth, torsoHeight, TorsoDepth), _shirtColor);
+
+    yield return new BodyPart(
+      new Vector3(0, torsoTop + HeadSize / 2f, 0), Vector3.Zero, 0f,
       new Vector3(HeadSize, HeadSize, HeadSize), SkinColor);
 
     // Sit just proud of the head's front face (local +Z — see UpdatePose's
     // use of Atan2(moveDirX, moveDirZ), which puts "forward" on +Z at
     // Heading == 0) so they don't z-fight with the head box behind them.
-    float eyeY = LegHeight + TorsoHeight + HeadSize / 2f;
+    float eyeY = torsoTop + HeadSize / 2f;
     float eyeZ = HeadSize / 2f + FaceDepth / 2f;
     yield return new BodyPart(
       new Vector3(-EyeOffsetX, eyeY, eyeZ), Vector3.Zero, 0f,
@@ -447,11 +500,11 @@ public class Actor
       new Vector3(LegThickness, LegHeight, LegThickness), PantsColor);
 
     yield return new BodyPart(
-      new Vector3(-ShoulderOffsetX, LegHeight + TorsoHeight, 0), new Vector3(0, -ArmLength / 2f, 0), _poseLeftArmDeg,
+      new Vector3(-ShoulderOffsetX, torsoTop, 0), new Vector3(0, -ArmLength / 2f, 0), _poseLeftArmDeg,
       new Vector3(ArmThickness, ArmLength, ArmThickness), SkinColor);
 
     yield return new BodyPart(
-      new Vector3(ShoulderOffsetX, LegHeight + TorsoHeight, 0), new Vector3(0, -ArmLength / 2f, 0), _poseRightArmDeg,
+      new Vector3(ShoulderOffsetX, torsoTop, 0), new Vector3(0, -ArmLength / 2f, 0), _poseRightArmDeg,
       new Vector3(ArmThickness, ArmLength, ArmThickness), SkinColor);
   }
 

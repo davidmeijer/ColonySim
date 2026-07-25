@@ -237,6 +237,7 @@ public static class Program
         foreach (var actor in actors) actor.Update(dt);
         ResolveOverlaps(actors);
         RepathStuckActors(map, actors);
+        UpdateWandering(map, actors);
     }
 
     // Soft collision: pushes any pair of actors that end up closer than two
@@ -285,6 +286,55 @@ public static class Program
             var path = AStar.FindPath(map, actor.TileX, actor.TileZ, dest.X, dest.Y, PathBlocker(blockingTiles, actor));
             actor.Reroute(path);
         }
+    }
+
+    // How far (in coarse tiles) an idle actor might wander off to, and how
+    // many random spots it'll try before giving up for this attempt (see
+    // Actor.DeferWander) — small numbers on purpose, so this reads as
+    // ambling near where it already is, not a cross-map errand.
+    const int WanderRadius = 4;
+    const int WanderAttempts = 6;
+
+    // Actors with nothing else going on amble a few tiles in a random
+    // direction once they've sat idle long enough (Actor.WantsToWander) —
+    // routed through the exact same SetPath/pathfinding machinery as a
+    // real player order, so a wandering actor gets stuck-detection,
+    // auto-reroute, and give-up behaviour for free, and a player order
+    // issued mid-wander overrides it exactly like it would anything else.
+    static void UpdateWandering(TileMap map, List<Actor> actors)
+    {
+        foreach (var actor in actors)
+        {
+            if (!actor.WantsToWander) continue;
+
+            if (PickWanderTile(map, actor.TileX, actor.TileZ) is not { } target)
+            {
+                actor.DeferWander();
+                continue;
+            }
+
+            var blockingTiles = BlockingTiles(actors, except: actor);
+            var path = AStar.FindPath(map, actor.TileX, actor.TileZ, target.X, target.Z, PathBlocker(blockingTiles, actor));
+            actor.SetPath(path);
+        }
+    }
+
+    // A handful of random tries within WanderRadius tiles, returning the
+    // first one that's actually walkable — good enough on a mostly-open
+    // map (the common case), and cheap to just give up on for a spot boxed
+    // in tight rather than searching harder for one.
+    static (int X, int Z)? PickWanderTile(TileMap map, int cx, int cz)
+    {
+        for (int i = 0; i < WanderAttempts; i++)
+        {
+            int dx = Random.Shared.Next(-WanderRadius, WanderRadius + 1);
+            int dz = Random.Shared.Next(-WanderRadius, WanderRadius + 1);
+            if (dx == 0 && dz == 0) continue;
+
+            int x = cx + dx, z = cz + dz;
+            if (map.IsWalkable(x, z)) return (x, z);
+        }
+        return null;
     }
 
     // The gear icon toggles the panel; everything else here only reacts
