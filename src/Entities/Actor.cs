@@ -91,6 +91,20 @@ public class Actor
   static readonly Color SkinColor = new(224, 172, 132, 255);
   static readonly Color PantsColor = new(64, 60, 58, 255);
 
+  // Two "eye" squares on the front of the head — otherwise arms, legs,
+  // torso and head are all perfectly front/back symmetric, so there'd be
+  // no way to tell which way an actor is actually facing (its Heading)
+  // just by looking at it. Two separated squares specifically, not one
+  // wide bar: a single dark stripe read ambiguously (could as easily be
+  // hair on the back of the head as a face on the front) — two distinct
+  // dots either side of centre, with visible skin colour between them, is
+  // a much less ambiguous "this is a face, this is the front" cue.
+  static readonly Color FaceColor = new(40, 30, 26, 255);
+  const float EyeSize = HeadSize * 0.16f;
+  const float EyeGap = HeadSize * 0.14f;
+  const float EyeOffsetX = EyeSize / 2f + EyeGap / 2f;
+  const float FaceDepth = 1.5f;
+
   // Each new actor gets the next colour in the list, so a group reads as
   // distinct individuals instead of an identical crowd.
   static readonly Color[] ShirtPalette =
@@ -412,6 +426,18 @@ public class Actor
       new Vector3(0, LegHeight + TorsoHeight + HeadSize / 2f, 0), Vector3.Zero, 0f,
       new Vector3(HeadSize, HeadSize, HeadSize), SkinColor);
 
+    // Sit just proud of the head's front face (local +Z — see UpdatePose's
+    // use of Atan2(moveDirX, moveDirZ), which puts "forward" on +Z at
+    // Heading == 0) so they don't z-fight with the head box behind them.
+    float eyeY = LegHeight + TorsoHeight + HeadSize / 2f;
+    float eyeZ = HeadSize / 2f + FaceDepth / 2f;
+    yield return new BodyPart(
+      new Vector3(-EyeOffsetX, eyeY, eyeZ), Vector3.Zero, 0f,
+      new Vector3(EyeSize, EyeSize, FaceDepth), FaceColor);
+    yield return new BodyPart(
+      new Vector3(EyeOffsetX, eyeY, eyeZ), Vector3.Zero, 0f,
+      new Vector3(EyeSize, EyeSize, FaceDepth), FaceColor);
+
     yield return new BodyPart(
       new Vector3(-HipOffsetX, LegHeight, 0), new Vector3(0, -LegHeight / 2f, 0), _poseLeftLegDeg,
       new Vector3(LegThickness, LegHeight, LegThickness), PantsColor);
@@ -471,14 +497,22 @@ public class Actor
     var world = new Vector3[8];
     for (int i = 0; i < 8; i++) world[i] = worldCenter + Vector3.Transform(local[i], rotation);
 
+    // Emitted as (a, d, c, b), not the seemingly-obvious (a, b, c, d): with
+    // this method's corner numbering, the naive order comes out wound
+    // backward relative to its own stated normal — the same discrepancy
+    // TileMap.AddQuad's own comment calls out ("raylib backface-culls by
+    // default, so a triangle wound the wrong way gets discarded from the
+    // very side it's meant to be seen from"), and the reason a whole actor
+    // used to render "inside out": every near face was being culled,
+    // showing the far faces through it instead.
     void Face(int a, int b, int c, int d, Vector3 localNormal)
     {
       Vector3 n = Vector3.TransformNormal(localNormal, rotation);
       Rlgl.Normal3f(n.X, n.Y, n.Z);
       Rlgl.Vertex3f(world[a].X, world[a].Y, world[a].Z);
-      Rlgl.Vertex3f(world[b].X, world[b].Y, world[b].Z);
-      Rlgl.Vertex3f(world[c].X, world[c].Y, world[c].Z);
       Rlgl.Vertex3f(world[d].X, world[d].Y, world[d].Z);
+      Rlgl.Vertex3f(world[c].X, world[c].Y, world[c].Z);
+      Rlgl.Vertex3f(world[b].X, world[b].Y, world[b].Z);
     }
 
     Rlgl.Begin(DrawMode.Quads);
