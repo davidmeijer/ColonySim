@@ -1171,6 +1171,7 @@ public static class Program
         // sun alone gives hills a sense of depth.
         sun.BeginLit();
         map.DrawSolid();
+        sun.BindWhiteAlbedo();
         map.DrawTrees();
         map.DrawBushes();
         map.DrawCampfiresLit();

@@ -1,3 +1,4 @@
+using System.IO;
 using System.Numerics;
 using System.Runtime.InteropServices;
 using Raylib_cs;
@@ -141,8 +142,22 @@ public class TileMap
   // changed — an advancing stream muddies fresh ground every tick, so
   // rebuilding all ~200 chunks on every such change would visibly stutter.
   Shader? _terrainShader;
-  readonly Model?[,] _chunkModels;
+
+  // One slot per texturable material (Grass/Dirt/Rock — see MaterialSlot),
+  // per chunk: a chunk's terrain can't be textured as a single draw call
+  // since different materials need different textures, so each chunk is
+  // really up to 3 small sub-models, one per material actually present.
+  const int MaterialSlotCount = 3;
+  readonly Model?[,,] _chunkModels;
   readonly bool[,] _chunkDirty;
+
+  // The actual per-material textures — see LoadMaterialTextures. A missing
+  // file becomes a 1x1 white pixel rather than skipping texturing
+  // entirely, so the shader's texColor * vertexColor multiply is always
+  // valid and just no-ops back to the plain lit vertex colour when no art
+  // has been supplied yet.
+  static readonly string[] MaterialTextureFile = { "grass.png", "dirt.png", "rock.png" };
+  readonly Texture2D[] _materialTextures = new Texture2D[MaterialSlotCount];
 
   // Water gets the same treatment on its own set of chunks, tracked
   // separately because the two go stale at completely different rates:
@@ -174,10 +189,12 @@ public class TileMap
 
     int chunksX = (FineWidth + ChunkSize - 1) / ChunkSize;
     int chunksZ = (FineDepth + ChunkSize - 1) / ChunkSize;
-    _chunkModels = new Model?[chunksX, chunksZ];
+    _chunkModels = new Model?[chunksX, chunksZ, MaterialSlotCount];
     _waterChunkModels = new Model?[chunksX, chunksZ];
     _chunkDirty = new bool[chunksX, chunksZ];
     MarkAllChunksDirty();
+
+    LoadMaterialTextures();
 
     var generated = WorldGenerator.GenerateRollingHillsWithLake(
       width, depth, FineSubdivisions, MaxHeight * FineSubdivisions, seed);
@@ -206,6 +223,33 @@ public class TileMap
     {
       _springs.Add(new Spring(springX, springZ));
       _springTiles.Add((springX, springZ));
+    }
+  }
+
+  // Looks for Assets/Textures/{grass,dirt,rock}.png next to the built
+  // executable — see Assets/Textures/README.md for exactly what to drop in
+  // there. Whatever's missing just gets a 1x1 white pixel instead, which
+  // is what keeps a material's appearance identical to today's flat colour
+  // until real art shows up for it.
+  void LoadMaterialTextures()
+  {
+    string dir = Path.Combine(AppContext.BaseDirectory, "Assets", "Textures");
+    for (int slot = 0; slot < MaterialSlotCount; slot++)
+    {
+      string path = Path.Combine(dir, MaterialTextureFile[slot]);
+      if (File.Exists(path))
+      {
+        var tex = Raylib.LoadTexture(path);
+        Raylib.SetTextureWrap(tex, TextureWrap.Repeat);
+        Raylib.SetTextureFilter(tex, TextureFilter.Bilinear);
+        _materialTextures[slot] = tex;
+      }
+      else
+      {
+        Image blank = Raylib.GenImageColor(1, 1, Color.White);
+        _materialTextures[slot] = Raylib.LoadTextureFromImage(blank);
+        Raylib.UnloadImage(blank);
+      }
     }
   }
 
@@ -911,27 +955,58 @@ public class TileMap
         int fxCount = Math.Min(ChunkSize, FineWidth - fx0);
         int fzCount = Math.Min(ChunkSize, FineDepth - fz0);
 
-        if (_chunkModels[cx, cz] is { } old) Raylib.UnloadModel(old);
-        _chunkModels[cx, cz] = BuildChunkModel(fx0, fz0, fxCount, fzCount);
+        for (int slot = 0; slot < MaterialSlotCount; slot++)
+          if (_chunkModels[cx, cz, slot] is { } old) Raylib.UnloadModel(old);
+
+        var built = BuildChunkModel(fx0, fz0, fxCount, fzCount);
+        for (int slot = 0; slot < MaterialSlotCount; slot++)
+          _chunkModels[cx, cz, slot] = built[slot];
+
         _chunkDirty[cx, cz] = false;
       }
     }
   }
 
-  // Builds one chunk's worth of voxel-cube geometry (top + exposed side
-  // faces only) and uploads it as its own small Model. Raylib's Mesh is a
-  // handful of raw unmanaged buffers (no managed-array wrapper for custom
-  // meshes), so vertex/normal/colour/index data is accumulated in plain
-  // Lists first, then copied into NativeMemory-allocated buffers at the
-  // end; UnloadModel frees that same memory later since raylib's allocator
-  // and .NET's NativeMemory both ultimately go through the platform's
-  // malloc/free.
-  unsafe Model? BuildChunkModel(int fx0, int fz0, int fxCount, int fzCount)
+  // Which of the 3 texturable buckets a material's faces land in — see
+  // MaterialTextureFile/_materialTextures and BuildChunkModel.
+  static int MaterialSlot(TileType t) => t switch
   {
-    var verts = new List<Vector3>();
-    var norms = new List<Vector3>();
-    var cols = new List<Color>();
-    var indices = new List<ushort>();
+    TileType.Grass => 0,
+    TileType.Dirt => 1,
+    TileType.Rock => 2,
+    _ => 1 // shouldn't happen (Air never gets a face)
+  };
+
+  // Accumulates one material's worth of a chunk's geometry. A chunk builds
+  // up to MaterialSlotCount of these (see BuildChunkModel) since a single
+  // Model can only carry one texture, and grass/dirt/rock need different
+  // ones.
+  sealed class ChunkMeshBuilder
+  {
+    public readonly List<Vector3> Verts = new();
+    public readonly List<Vector3> Norms = new();
+    public readonly List<Color> Cols = new();
+    public readonly List<Vector2> Uvs = new();
+    public readonly List<ushort> Indices = new();
+  }
+
+  // World units one texture tile spans, for both top-face and wall UVs —
+  // one coarse tile's worth, so a texture is authored at "this is what one
+  // tile of this material looks like" scale.
+  const float TextureWorldSize = TileSize;
+
+  // Builds one chunk's worth of voxel-cube geometry (top + exposed side
+  // faces only), split into up to MaterialSlotCount per-material sub-
+  // models. Raylib's Mesh is a handful of raw unmanaged buffers (no
+  // managed-array wrapper for custom meshes), so vertex/normal/colour/uv/
+  // index data is accumulated in plain Lists first, then copied into
+  // NativeMemory-allocated buffers at the end; UnloadModel frees that same
+  // memory later since raylib's allocator and .NET's NativeMemory both
+  // ultimately go through the platform's malloc/free.
+  unsafe Model?[] BuildChunkModel(int fx0, int fz0, int fxCount, int fzCount)
+  {
+    var builders = new ChunkMeshBuilder[MaterialSlotCount];
+    for (int i = 0; i < MaterialSlotCount; i++) builders[i] = new ChunkMeshBuilder();
 
     // Winding has to actually match each face's stated normal, not just the
     // normal data itself — raylib backface-culls by default, so a triangle
@@ -940,14 +1015,29 @@ public class TileMap
     // vertex normals say. (a, c, b) / (a, d, c) is the order that comes out
     // CCW as seen from the direction each of this method's callers' normal
     // actually points.
-    void AddQuad(Vector3 a, Vector3 b, Vector3 c, Vector3 d, Color color, Vector3 normal)
+    void AddQuad(
+      TileType material, Vector3 a, Vector3 b, Vector3 c, Vector3 d,
+      Color colA, Color colB, Color colC, Color colD,
+      Vector2 uvA, Vector2 uvB, Vector2 uvC, Vector2 uvD, Vector3 normal)
     {
-      ushort baseIndex = (ushort)verts.Count;
-      verts.Add(a); verts.Add(b); verts.Add(c); verts.Add(d);
-      for (int i = 0; i < 4; i++) { norms.Add(normal); cols.Add(color); }
-      indices.Add(baseIndex); indices.Add((ushort)(baseIndex + 2)); indices.Add((ushort)(baseIndex + 1));
-      indices.Add(baseIndex); indices.Add((ushort)(baseIndex + 3)); indices.Add((ushort)(baseIndex + 2));
+      var m = builders[MaterialSlot(material)];
+      ushort baseIndex = (ushort)m.Verts.Count;
+      m.Verts.Add(a); m.Verts.Add(b); m.Verts.Add(c); m.Verts.Add(d);
+      m.Norms.Add(normal); m.Norms.Add(normal); m.Norms.Add(normal); m.Norms.Add(normal);
+      m.Cols.Add(colA); m.Cols.Add(colB); m.Cols.Add(colC); m.Cols.Add(colD);
+      m.Uvs.Add(uvA); m.Uvs.Add(uvB); m.Uvs.Add(uvC); m.Uvs.Add(uvD);
+      m.Indices.Add(baseIndex); m.Indices.Add((ushort)(baseIndex + 2)); m.Indices.Add((ushort)(baseIndex + 1));
+      m.Indices.Add(baseIndex); m.Indices.Add((ushort)(baseIndex + 3)); m.Indices.Add((ushort)(baseIndex + 2));
     }
+
+    // Walls stay flat-shaded (one colour for all 4 corners) — only top
+    // faces get the full per-corner AO treatment; see CornerBrightness.
+    void AddQuadFlat(
+      TileType material, Vector3 a, Vector3 b, Vector3 c, Vector3 d, Color color,
+      Vector2 uvA, Vector2 uvB, Vector2 uvC, Vector2 uvD, Vector3 normal) =>
+      AddQuad(material, a, b, c, d, color, color, color, color, uvA, uvB, uvC, uvD, normal);
+
+    Vector2 UV(float u, float v) => new(u / TextureWorldSize, v / TextureWorldSize);
 
     for (int fz = fz0; fz < fz0 + fzCount; fz++)
     {
@@ -960,75 +1050,103 @@ public class TileMap
         float z0 = fz * VoxelSize, z1 = (fz + 1) * VoxelSize;
         float topY = height * VoxelSize;
 
-        AddQuad(
+        var topMat = _voxelTop[fx, fz];
+        var topColor = WithNoise(ColorFor(topMat), fx, fz);
+        AddQuad(topMat,
           new Vector3(x0, topY, z0), new Vector3(x1, topY, z0),
           new Vector3(x1, topY, z1), new Vector3(x0, topY, z1),
-          ColorFor(_voxelTop[fx, fz]), new Vector3(0, 1, 0));
+          Shaded(topColor, CornerBrightness(fx, fz, height, -1, -1)),
+          Shaded(topColor, CornerBrightness(fx, fz, height, +1, -1)),
+          Shaded(topColor, CornerBrightness(fx, fz, height, +1, +1)),
+          Shaded(topColor, CornerBrightness(fx, fz, height, -1, +1)),
+          UV(x0, z0), UV(x1, z0), UV(x1, z1), UV(x0, z1),
+          new Vector3(0, 1, 0));
 
         int westH = FineHeightOrZero(fx - 1, fz);
         if (westH < height)
           foreach (var (bottom, top, mat) in WallBands(fx, fz, westH, height))
-            AddQuad(
+            AddQuadFlat(mat,
               new Vector3(x0, top * VoxelSize, z0), new Vector3(x0, top * VoxelSize, z1),
               new Vector3(x0, bottom * VoxelSize, z1), new Vector3(x0, bottom * VoxelSize, z0),
-              ColorFor(mat), new Vector3(-1, 0, 0));
+              WithNoise(ColorFor(mat), fx, fz),
+              UV(z0, top * VoxelSize), UV(z1, top * VoxelSize), UV(z1, bottom * VoxelSize), UV(z0, bottom * VoxelSize),
+              new Vector3(-1, 0, 0));
 
         int eastH = FineHeightOrZero(fx + 1, fz);
         if (eastH < height)
           foreach (var (bottom, top, mat) in WallBands(fx, fz, eastH, height))
-            AddQuad(
+            AddQuadFlat(mat,
               new Vector3(x1, top * VoxelSize, z1), new Vector3(x1, top * VoxelSize, z0),
               new Vector3(x1, bottom * VoxelSize, z0), new Vector3(x1, bottom * VoxelSize, z1),
-              ColorFor(mat), new Vector3(1, 0, 0));
+              WithNoise(ColorFor(mat), fx, fz),
+              UV(z1, top * VoxelSize), UV(z0, top * VoxelSize), UV(z0, bottom * VoxelSize), UV(z1, bottom * VoxelSize),
+              new Vector3(1, 0, 0));
 
         int southH = FineHeightOrZero(fx, fz - 1);
         if (southH < height)
           foreach (var (bottom, top, mat) in WallBands(fx, fz, southH, height))
-            AddQuad(
+            AddQuadFlat(mat,
               new Vector3(x1, top * VoxelSize, z0), new Vector3(x0, top * VoxelSize, z0),
               new Vector3(x0, bottom * VoxelSize, z0), new Vector3(x1, bottom * VoxelSize, z0),
-              ColorFor(mat), new Vector3(0, 0, -1));
+              WithNoise(ColorFor(mat), fx, fz),
+              UV(x1, top * VoxelSize), UV(x0, top * VoxelSize), UV(x0, bottom * VoxelSize), UV(x1, bottom * VoxelSize),
+              new Vector3(0, 0, -1));
 
         int northH = FineHeightOrZero(fx, fz + 1);
         if (northH < height)
           foreach (var (bottom, top, mat) in WallBands(fx, fz, northH, height))
-            AddQuad(
+            AddQuadFlat(mat,
               new Vector3(x0, top * VoxelSize, z1), new Vector3(x1, top * VoxelSize, z1),
               new Vector3(x1, bottom * VoxelSize, z1), new Vector3(x0, bottom * VoxelSize, z1),
-              ColorFor(mat), new Vector3(0, 0, 1));
+              WithNoise(ColorFor(mat), fx, fz),
+              UV(x0, top * VoxelSize), UV(x1, top * VoxelSize), UV(x1, bottom * VoxelSize), UV(x0, bottom * VoxelSize),
+              new Vector3(0, 0, 1));
       }
     }
 
-    if (verts.Count == 0) return null;
+    var models = new Model?[MaterialSlotCount];
+    for (int slot = 0; slot < MaterialSlotCount; slot++)
+      models[slot] = UploadChunkMesh(builders[slot], slot);
+    return models;
+  }
 
-    int vertexCount = verts.Count;
-    int triangleCount = indices.Count / 3;
+  unsafe Model? UploadChunkMesh(ChunkMeshBuilder b, int materialSlot)
+  {
+    if (b.Verts.Count == 0) return null;
+
+    int vertexCount = b.Verts.Count;
+    int triangleCount = b.Indices.Count / 3;
 
     var mesh = new Mesh { VertexCount = vertexCount, TriangleCount = triangleCount };
     mesh.Vertices = (float*)NativeMemory.Alloc((nuint)(vertexCount * 3 * sizeof(float)));
     mesh.Normals = (float*)NativeMemory.Alloc((nuint)(vertexCount * 3 * sizeof(float)));
     mesh.Colors = (byte*)NativeMemory.Alloc((nuint)(vertexCount * 4));
-    mesh.Indices = (ushort*)NativeMemory.Alloc((nuint)(indices.Count * sizeof(ushort)));
+    mesh.TexCoords = (float*)NativeMemory.Alloc((nuint)(vertexCount * 2 * sizeof(float)));
+    mesh.Indices = (ushort*)NativeMemory.Alloc((nuint)(b.Indices.Count * sizeof(ushort)));
 
     for (int i = 0; i < vertexCount; i++)
     {
-      mesh.Vertices[i * 3 + 0] = verts[i].X;
-      mesh.Vertices[i * 3 + 1] = verts[i].Y;
-      mesh.Vertices[i * 3 + 2] = verts[i].Z;
+      mesh.Vertices[i * 3 + 0] = b.Verts[i].X;
+      mesh.Vertices[i * 3 + 1] = b.Verts[i].Y;
+      mesh.Vertices[i * 3 + 2] = b.Verts[i].Z;
 
-      mesh.Normals[i * 3 + 0] = norms[i].X;
-      mesh.Normals[i * 3 + 1] = norms[i].Y;
-      mesh.Normals[i * 3 + 2] = norms[i].Z;
+      mesh.Normals[i * 3 + 0] = b.Norms[i].X;
+      mesh.Normals[i * 3 + 1] = b.Norms[i].Y;
+      mesh.Normals[i * 3 + 2] = b.Norms[i].Z;
 
-      mesh.Colors[i * 4 + 0] = cols[i].R;
-      mesh.Colors[i * 4 + 1] = cols[i].G;
-      mesh.Colors[i * 4 + 2] = cols[i].B;
+      mesh.Colors[i * 4 + 0] = b.Cols[i].R;
+      mesh.Colors[i * 4 + 1] = b.Cols[i].G;
+      mesh.Colors[i * 4 + 2] = b.Cols[i].B;
       mesh.Colors[i * 4 + 3] = 255;
+
+      mesh.TexCoords[i * 2 + 0] = b.Uvs[i].X;
+      mesh.TexCoords[i * 2 + 1] = b.Uvs[i].Y;
     }
-    for (int i = 0; i < indices.Count; i++) mesh.Indices[i] = indices[i];
+    for (int i = 0; i < b.Indices.Count; i++) mesh.Indices[i] = b.Indices[i];
 
     Raylib.UploadMesh(ref mesh, false);
     var model = Raylib.LoadModelFromMesh(mesh);
+    model.Materials[0].Maps[(int)MaterialMapIndex.Albedo].Texture = _materialTextures[materialSlot];
     if (_terrainShader is { } shader) model.Materials[0].Shader = shader;
     return model;
   }
@@ -1209,6 +1327,8 @@ public class TileMap
       if (model is { } m) Raylib.UnloadModel(m);
     foreach (var model in _waterChunkModels)
       if (model is { } m) Raylib.UnloadModel(m);
+    foreach (var tex in _materialTextures)
+      Raylib.UnloadTexture(tex);
   }
 
   // --- Water rendering ---
@@ -1415,6 +1535,71 @@ public class TileMap
         Raylib.DrawCube(stonePos, TileSize * 0.15f, TileSize * 0.16f, TileSize * 0.15f, SpringStoneColor);
       }
     }
+  }
+
+  // --- Cheap terrain-surface polish ---------------------------------------
+  //
+  // Two things that make flat-coloured voxels read as real geometry instead
+  // of a solid-shaded blob, both static/deterministic functions of a fine
+  // column's position so nothing extra needs to be stored per voxel:
+  //
+  //  - WithNoise: a small per-column brightness jitter, so a big flat plain
+  //    doesn't read as one dead-flat colour.
+  //  - CornerBrightness: per-corner ambient occlusion on top faces — a
+  //    taller neighbouring column shadows the corner it shares with this
+  //    one, which is what makes a dug pit's rim, or the base of a rise,
+  //    actually read as a nook instead of just a flat shaded plane.
+
+  const float ColorNoiseAmplitude = 0.06f;
+
+  // Cheap deterministic hash -> roughly uniform in [-1, 1]. Doesn't need to
+  // be a good hash, just stable and fast — this runs per vertex, per chunk
+  // rebuild.
+  static float ColumnNoise(int fx, int fz)
+  {
+    int h = fx * 374761393 + fz * 668265263;
+    h = (h ^ (h >> 13)) * 1274126177;
+    h ^= h >> 16;
+    return ((h & 0xFFFF) / 65535f) * 2f - 1f;
+  }
+
+  static Color WithNoise(Color c, int fx, int fz)
+  {
+    float n = 1f + ColumnNoise(fx, fz) * ColorNoiseAmplitude;
+    return new Color(
+      (byte)Math.Clamp(c.R * n, 0, 255),
+      (byte)Math.Clamp(c.G * n, 0, 255),
+      (byte)Math.Clamp(c.B * n, 0, 255),
+      c.A);
+  }
+
+  static Color Shaded(Color c, float brightness) => new(
+    (byte)Math.Clamp(c.R * brightness, 0, 255),
+    (byte)Math.Clamp(c.G * brightness, 0, 255),
+    (byte)Math.Clamp(c.B * brightness, 0, 255),
+    c.A);
+
+  // 0 occluding neighbours -> full brightness, 3 -> darkest corner.
+  static readonly float[] AOBrightness = { 1f, 0.82f, 0.66f, 0.52f };
+
+  // How occluded one corner of column (fx, fz)'s top face is. (dx, dz)
+  // (each ±1) picks which of the 4 corners: the two edge-adjacent
+  // neighbours are (fx+dx, fz) and (fx, fz+dz), the diagonal one sharing
+  // just that corner is (fx+dx, fz+dz). A neighbour taller than this
+  // column is solid all the way up past our own top, so it shadows the
+  // corner it shares with us — true from a plain heightmap even without
+  // real 3D occupancy, since digging/height never leaves overhangs. The
+  // "both edges occluded -> max, ignore the diagonal" rule is the standard
+  // voxel-AO trick (see 0fps.net's writeup): it stops a corner already
+  // boxed in by its two edges from being double-counted against the
+  // diagonal too.
+  float CornerBrightness(int fx, int fz, int height, int dx, int dz)
+  {
+    bool side1 = FineHeightOrZero(fx + dx, fz) > height;
+    bool side2 = FineHeightOrZero(fx, fz + dz) > height;
+    bool corner = FineHeightOrZero(fx + dx, fz + dz) > height;
+    int occlusion = side1 && side2 ? 3 : (side1 ? 1 : 0) + (side2 ? 1 : 0) + (corner ? 1 : 0);
+    return AOBrightness[occlusion];
   }
 
   static Color ColorFor(TileType t) => t switch

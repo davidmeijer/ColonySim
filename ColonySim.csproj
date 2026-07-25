@@ -11,4 +11,10 @@
   <ItemGroup>
     <PackageReference Include="Raylib-cs" Version="8.0.0" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- Textures live next to the built exe (see TileMap.LoadMaterialTextures)
+         so they're found the same way whether run via `dotnet run` or the
+         built binary directly. -->
+    <None Include="Assets\**" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
 </Project>

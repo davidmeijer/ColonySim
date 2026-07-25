@@ -23,18 +23,21 @@ public class SunLight
     in vec3 vertexPosition;
     in vec3 vertexNormal;
     in vec4 vertexColor;
+    in vec2 vertexTexCoord;
 
     uniform mat4 mvp;
 
     out vec3 fragPosition;
     out vec3 fragNormal;
     out vec4 fragColor;
+    out vec2 fragTexCoord;
 
     void main()
     {
         fragPosition = vertexPosition;
         fragNormal = vertexNormal;
         fragColor = vertexColor;
+        fragTexCoord = vertexTexCoord;
         gl_Position = mvp * vec4(vertexPosition, 1.0);
     }
     """;
@@ -47,12 +50,22 @@ public class SunLight
     in vec3 fragPosition;
     in vec3 fragNormal;
     in vec4 fragColor;
+    in vec2 fragTexCoord;
 
     uniform vec3 lightDir;
     uniform vec3 lightColor;
     uniform vec3 ambientColor;
     uniform mat4 lightVP;
     uniform sampler2D shadowMap;
+
+    // Terrain's per-material texture (see TileMap.LoadMaterialTextures) —
+    // raylib auto-binds a model's MaterialMapIndex.Albedo texture to this
+    // by name. Anything drawn without its own real texture (trees, bushes,
+    // actors, ...) gets a 1x1 white pixel rebound here first (see
+    // SunLight.BindWhiteAlbedo), so texColor is always a valid multiply
+    // identity rather than leftover state from whatever textured model
+    // drew last.
+    uniform sampler2D texture0;
 
     #define MAX_POINT_LIGHTS 8
     #define POINT_LIGHT_RADIUS 220.0
@@ -104,7 +117,14 @@ public class SunLight
         // from the light — it's in its own shadow regardless.
         float shadow = ndotl > 0.0 ? ShadowFactor(fragPosition, ndotl) : 1.0;
 
-        vec3 lit = fragColor.rgb * (ambientColor + lightColor * ndotl * shadow);
+        // A missing texture is a 1x1 white pixel (see LoadMaterialTextures/
+        // BindWhiteAlbedo), so this multiply is a no-op wherever no real
+        // art has been supplied yet — albedo just falls back to the plain
+        // lit vertex colour, exactly as it worked before texturing existed.
+        vec4 texColor = texture(texture0, fragTexCoord);
+        vec3 albedo = fragColor.rgb * texColor.rgb;
+
+        vec3 lit = albedo * (ambientColor + lightColor * ndotl * shadow);
 
         // Local glow sources (campfires) — additive, unshadowed (a full
         // shadow map per point light would be a lot of machinery for a
@@ -117,10 +137,10 @@ public class SunLight
             float dist = length(toLight);
             float pndotl = max(dot(n, toLight / max(dist, 0.0001)), 0.0);
             float atten = clamp(1.0 - dist / POINT_LIGHT_RADIUS, 0.0, 1.0);
-            lit += fragColor.rgb * pointLightColor[i] * pndotl * (atten * atten);
+            lit += albedo * pointLightColor[i] * pndotl * (atten * atten);
         }
 
-        finalColor = vec4(lit, fragColor.a);
+        finalColor = vec4(lit, fragColor.a * texColor.a);
     }
     """;
 
@@ -151,6 +171,9 @@ public class SunLight
   readonly int _pointLightPosLoc, _pointLightColorLoc, _pointLightCountLoc;
   readonly Vector3[] _pointLightPosBuffer = new Vector3[MaxPointLights];
   readonly Vector3[] _pointLightColorBuffer = new Vector3[MaxPointLights];
+
+  // A neutral 1x1 white pixel — see BindWhiteAlbedo.
+  readonly Texture2D _whiteTexture;
 
   readonly uint _shadowFboId;
   readonly Texture2D _shadowDepthTexture;
@@ -245,6 +268,10 @@ public class SunLight
     _pointLightPosLoc = Raylib.GetShaderLocation(_shader, "pointLightPos");
     _pointLightColorLoc = Raylib.GetShaderLocation(_shader, "pointLightColor");
     _pointLightCountLoc = Raylib.GetShaderLocation(_shader, "pointLightCount");
+
+    Image whiteImg = Raylib.GenImageColor(1, 1, Color.White);
+    _whiteTexture = Raylib.LoadTextureFromImage(whiteImg);
+    Raylib.UnloadImage(whiteImg);
 
     (_shadowFboId, _shadowDepthTexture) = LoadShadowMap(ShadowMapSize);
     _shadowTarget = new RenderTexture2D
@@ -394,6 +421,7 @@ public class SunLight
     Matrix4x4 lightViewProj = Raymath.MatrixMultiply(lightView, lightProj);
     Raylib.BeginShaderMode(_shader);
     map.DrawSolid();
+    BindWhiteAlbedo();
     map.DrawTrees();
     map.DrawBushes();
     map.DrawCampfiresLit();
@@ -433,6 +461,23 @@ public class SunLight
   public void BeginLit() => Raylib.BeginShaderMode(_shader);
   public void EndLit() => Raylib.EndShaderMode();
 
+  // Immediate-mode shapes (DrawCube/DrawCylinder — trees, bushes, campfire
+  // logs/stones, spring stones, actors) never set their own texcoords or
+  // texture, so left alone they'd just inherit whatever texture unit 0 was
+  // last bound to — after the terrain's textured chunk models draw, that's
+  // a real material texture, sampled at whichever texcoord (0, 0) happens
+  // to land on. Call this once, right after the terrain draw and before
+  // any of those untextured shapes, to put a neutral white pixel back so
+  // they render in their own flat vertex colour, same as before texturing
+  // existed. DrawModel-based draws (terrain, water) don't need this: they
+  // always rebind their own model's texture explicitly regardless of what
+  // was bound before them.
+  public void BindWhiteAlbedo()
+  {
+    Rlgl.ActiveTextureSlot(0);
+    Rlgl.EnableTexture(_whiteTexture.Id);
+  }
+
   // The sun by day, a pale moon (roughly opposite the sun, since it's not
   // worth modelling real moon phases here) by night. Drawn unlit — it IS
   // the light — so call this outside BeginLit/EndLit.
@@ -458,5 +503,6 @@ public class SunLight
   {
     Rlgl.UnloadFramebuffer(_shadowFboId);
     Raylib.UnloadShader(_shader);
+    Raylib.UnloadTexture(_whiteTexture);
   }
 }
