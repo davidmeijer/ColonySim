@@ -4,11 +4,11 @@ namespace ColonySim.Pathfinding;
 
 public static class AStar
 {
-    // isBlocked marks tiles the map alone doesn't know about — chiefly pawns
+    // isBlocked marks tiles the map alone doesn't know about — chiefly actors
     // standing still with nowhere left to go, which should be routed around
-    // just like rock. Pawns that are still walking are left out of this: a
+    // just like rock. Actors that are still walking are left out of this: a
     // path in progress is expected to clear out of the way (or the mover
-    // waits at worst), so only idle pawns count as fixed obstacles.
+    // waits at worst), so only idle actors count as fixed obstacles.
     public static List<(int X, int Y)> FindPath(TileMap map, int startX, int startY, int goalX, int goalY,
         Func<int, int, bool>? isBlocked = null)
     {

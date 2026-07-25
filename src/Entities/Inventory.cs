@@ -1,6 +1,6 @@
 namespace ColonySim.Entities;
 
-// A pawn's carried materials, tracked as a count per material name rather
+// An actor's carried materials, tracked as a count per material name rather
 // than a list of individual objects — a single dig can hand over up to a
 // full tile layer (100 voxels) at once, so per-item objects would just be
 // wasted allocations with no benefit.

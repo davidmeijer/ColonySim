@@ -8,7 +8,7 @@ namespace ColonySim.World;
 //
 // - The COARSE grid (Width x Depth, TileSize world units per cell) is what
 //   pathfinding, walkability, tile occupancy, and digging all operate on —
-//   a pawn occupies exactly one coarse tile, same as it always has.
+//   an actor occupies exactly one coarse tile, same as it always has.
 // - The FINE grid (Width*FineSubdivisions x Depth*FineSubdivisions,
 //   VoxelSize world units per cell — one coarse tile's worth of fine
 //   voxels is a 10x10 patch) is the real terrain data and what gets
@@ -43,7 +43,7 @@ public class TileMap
   // just re-expressed in the finer unit.
   const int DirtBandVoxels = 3 * FineSubdivisions;
 
-  // A pawn can climb at most half an old block in one step; anything
+  // An actor can climb at most half an old block in one step; anything
   // steeper has to be routed around (or, eventually, dug into a ramp).
   const int MaxStepUpLevels = FineSubdivisions / 2;
 
@@ -110,7 +110,7 @@ public class TileMap
   readonly HashSet<(int X, int Z)> _treeTiles = new();
 
   // Bushes, sprinkled individually. Blocks pathfinding the same way a tree
-  // does — a pawn can't push through a shrub any more than a trunk.
+  // does — an actor can't push through a shrub any more than a trunk.
   readonly List<Bush> _bushes = new();
   readonly HashSet<(int X, int Z)> _bushTiles = new();
 
@@ -327,7 +327,7 @@ public class TileMap
   }
 
   // How many voxels a single dig action removes at most, regardless of how
-  // much room the digging pawn has. Deliberately well below a full layer
+  // much room the digging actor has. Deliberately well below a full layer
   // (100): digging a flat tile should visibly grow a dug patch across
   // several actions, not change the whole tile's height in one click.
   const int DigRatePerAction = 10;
@@ -336,7 +336,7 @@ public class TileMap
   // Removes real, positional voxels: only from whichever fine columns are
   // currently at the tile's tallest height (its actual top layer), one
   // voxel each, up to DigRatePerAction (further capped by maxVoxels,
-  // typically the digging pawn's remaining inventory room). Deliberately
+  // typically the digging actor's remaining inventory room). Deliberately
   // does NOT touch — let alone re-flatten — the rest of the tile, so a
   // plateau visibly erodes into an uneven, growing pit across repeated
   // digs instead of the whole tile's height dropping in one action; only
@@ -378,7 +378,7 @@ public class TileMap
 
   // How many voxels are needed to top off this tile's current partially-
   // filled level (the lowest level that isn't completely full) — i.e. how
-  // much Deposit needs from a pawn's inventory to raise this tile by one
+  // much Deposit needs from an actor's inventory to raise this tile by one
   // whole unit.
   public int VoxelsNeededToRaise(int x, int z)
   {
@@ -390,7 +390,7 @@ public class TileMap
   // Tops off the tile's current partial level, raising its equalized
   // height by exactly one unit. Returns how many voxels that took (the
   // caller is responsible for actually removing that many items from the
-  // depositing pawn's inventory), or 0 if the tile's already at the
+  // depositing actor's inventory), or 0 if the tile's already at the
   // maximum height or out of bounds.
   public int Deposit(int x, int z)
   {
@@ -404,7 +404,7 @@ public class TileMap
     return needed;
   }
 
-  // Whether a pawn standing at (fromX, fromZ) can take one step onto the
+  // Whether an actor standing at (fromX, fromZ) can take one step onto the
   // adjacent tile (toX, toZ): the destination has to be walkable on its
   // own terms, and the climb can't be steeper than half an old block.
   // Stepping down is never limited — only climbing.
@@ -414,13 +414,13 @@ public class TileMap
     return EdgeRise(fromX, fromZ, toX, toZ) <= MaxStepUpLevels;
   }
 
-  // The height a pawn actually has to climb crossing directly from one
+  // The height an actor actually has to climb crossing directly from one
   // coarse tile into the next. Deliberately NOT the two tiles' single
   // centre fine columns (one point out of the 100 in each tile) — on
   // rolling terrain that single sample is easily unrepresentative of the
   // tile as a whole, which is exactly what let a visually gradual ramp get
   // rejected as an unclimbable cliff. Instead this walks every fine-voxel
-  // column pair straddling the shared border — the actual ground a pawn's
+  // column pair straddling the shared border — the actual ground an actor's
   // feet cross when it takes the step — and takes the median rise across
   // it, so a genuinely gradual slope reads as gradual even when a column
   // or two right on the border is locally bumpy, while a real step/cliff
@@ -482,7 +482,7 @@ public class TileMap
     return true;
   }
 
-  // Find any walkable tile: used to place a pawn at startup.
+  // Find any walkable tile: used to place an actor at startup.
   public (int X, int Y) FirstWalkable()
   {
     for (int x = 0; x < Width; x++)
@@ -491,7 +491,7 @@ public class TileMap
     return (0, 0);
   }
 
-  // Every walkable tile: used to scatter a starting roster of pawns.
+  // Every walkable tile: used to scatter a starting roster of actors.
   public IEnumerable<(int X, int Y)> WalkableTiles()
   {
     for (int x = 0; x < Width; x++)
@@ -506,7 +506,7 @@ public class TileMap
 
   // The actual ground height at an arbitrary world position — the true
   // fine-voxel height, not the coarse tile's representative value. This is
-  // what pawns stand on, so their feet always match the real rendered
+  // what actors stand on, so their feet always match the real rendered
   // surface (including immediately after a dig — nothing needs to catch up).
   public float SmoothSurfaceY(float worldX, float worldZ)
   {
@@ -631,7 +631,7 @@ public class TileMap
   // Wires this map's terrain chunks up to the lighting shader. DrawModel
   // doesn't respect BeginShaderMode (it always uses its own material's
   // shader), so this has to be assigned directly rather than just wrapping
-  // DrawSolid() in BeginLit/EndLit like the cube-based pawns and water are.
+  // DrawSolid() in BeginLit/EndLit like the cube-based actors and water are.
   public void SetTerrainShader(Shader shader)
   {
     _terrainShader = shader;
@@ -795,7 +795,7 @@ public class TileMap
   // The lit fill. Draw this inside a lighting shader's BeginMode/EndMode —
   // though for these chunk models specifically, what actually makes them
   // lit is the shader assigned in SetTerrainShader; BeginLit/EndLit only
-  // matter here for staying consistent with the pawns/water drawn
+  // matter here for staying consistent with the actors/water drawn
   // alongside them.
   public void DrawSolid()
   {

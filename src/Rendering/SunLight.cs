@@ -313,14 +313,14 @@ public class SunLight
     (byte)Math.Clamp(rgb01.Z * 255f, 0, 255),
     (byte)255);
 
-  // Renders the map's terrain, trees, bushes, and pawns into the shadow
+  // Renders the map's terrain, trees, bushes, and actors into the shadow
   // map from the light's point of view, then wires the result (the
   // light's combined view-projection matrix, plus the depth texture
   // itself) into the main shader so the very next lit pass already sees
   // today's shadows. Has to run once per frame, not just when the light
   // moves a lot: the light drifts continuously, so a cached shadow map
   // would start going stale immediately.
-  public void RenderShadowMap(TileMap map, IEnumerable<Pawn> pawns)
+  public void RenderShadowMap(TileMap map, IEnumerable<Actor> actors)
   {
     float mapHeight = TileMap.MaxHeight * TileMap.TileSize;
     Vector3 boundsCenter = new(map.WidthPx / 2f, mapHeight / 2f, map.DepthPx / 2f);
@@ -364,7 +364,7 @@ public class SunLight
     map.DrawSolid();
     map.DrawTrees();
     map.DrawBushes();
-    foreach (var pawn in pawns) pawn.DrawShadowCaster();
+    foreach (var actor in actors) actor.DrawShadowCaster();
     Raylib.EndShaderMode();
     Raylib.EndMode3D();
     Raylib.EndTextureMode();
@@ -375,7 +375,7 @@ public class SunLight
     BindShadowMapSampler();
   }
 
-  // Wrap the lit draw calls (terrain fill, water, pawns) between these.
+  // Wrap the lit draw calls (terrain fill, water, actors) between these.
   public void BeginLit() => Raylib.BeginShaderMode(_shader);
   public void EndLit() => Raylib.EndShaderMode();
 

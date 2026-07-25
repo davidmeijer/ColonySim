@@ -11,7 +11,7 @@ public static class Program
 {
     const int ScreenWidth = 1280;
     const int ScreenHeight = 720;
-    const int PawnCount = 10;
+    const int ActorCount = 10;
 
     // How far (in screen pixels) the mouse has to move while a button is held
     // before a press+release counts as a drag instead of a click.
@@ -21,7 +21,7 @@ public static class Program
     // object instead of a growing pile of ref parameters.
     class SelectionState
     {
-        public readonly HashSet<Pawn> Selected = new();
+        public readonly HashSet<Actor> Selected = new();
 
         public Vector2? LeftDownPos;
         public bool BoxSelecting;
@@ -31,7 +31,7 @@ public static class Program
     }
 
     // The action menu: a few buttons that appear along the bottom of the
-    // screen whenever at least one pawn is selected. Fixed screen positions,
+    // screen whenever at least one actor is selected. Fixed screen positions,
     // so Update (input) and Draw (rendering) can each compute the same
     // rectangles independently without sharing extra layout state.
     static readonly Rectangle JumpButtonRect = new(10, ScreenHeight - 66, 80, 28);
@@ -80,10 +80,10 @@ public static class Program
         // The world: a voxel grid with height. The seed makes generation repeatable.
         var map = new TileMap(40, 30, seed: 1234);
 
-        // A roster of pawns, scattered across distinct walkable tiles.
+        // A roster of actors, scattered across distinct walkable tiles.
         var spawnRng = new Random(99);
-        var spawnTiles = map.WalkableTiles().OrderBy(_ => spawnRng.Next()).Take(PawnCount).ToList();
-        var pawns = spawnTiles.Select(t => new Pawn(map, t.X, t.Y)).ToList();
+        var spawnTiles = map.WalkableTiles().OrderBy(_ => spawnRng.Next()).Take(ActorCount).ToList();
+        var actors = spawnTiles.Select(t => new Actor(map, t.X, t.Y)).ToList();
 
         var selection = new SelectionState();
         var settingsMenu = new SettingsMenuState();
@@ -121,11 +121,11 @@ public static class Program
             // movement by dt makes speeds frame-rate independent.
             float dt = Raylib.GetFrameTime();
 
-            Update(dt, map, pawns, selection, settingsMenu, sun, ref camera, ref camTarget, ref camYaw, ref camPitch, ref camDistance, ref showGrid);
+            Update(dt, map, actors, selection, settingsMenu, sun, ref camera, ref camTarget, ref camYaw, ref camPitch, ref camDistance, ref showGrid);
             map.UpdateWater(dt);
             map.UpdateVegetation(dt);
             sun.Update(dt);
-            Draw(map, pawns, selection, settingsMenu, camera, sun, showGrid);
+            Draw(map, actors, selection, settingsMenu, camera, sun, showGrid);
         }
 
         sun.Unload();
@@ -133,7 +133,7 @@ public static class Program
         Raylib.CloseWindow();
     }
 
-    static void Update(float dt, TileMap map, List<Pawn> pawns, SelectionState selection, SettingsMenuState settingsMenu,
+    static void Update(float dt, TileMap map, List<Actor> actors, SelectionState selection, SettingsMenuState settingsMenu,
         SunLight sun, ref Camera3D camera, ref Vector3 camTarget, ref float yaw, ref float pitch, ref float distance, ref bool showGrid)
     {
         // --- Zoom with the mouse wheel, clamped to a sane range ---
@@ -191,8 +191,8 @@ public static class Program
         // otherwise clicking "Jump" would also register as a world click and
         // immediately clear the very selection you just acted on.
         bool menuConsumedClick = UpdateActionMenu(map, selection);
-        UpdateSelection(pawns, selection, camera, shiftHeld, menuConsumedClick || settingsConsumedClick);
-        UpdateMoveOrders(map, pawns, selection, camera);
+        UpdateSelection(actors, selection, camera, shiftHeld, menuConsumedClick || settingsConsumedClick);
+        UpdateMoveOrders(map, actors, selection, camera);
 
         // Everyone seeks their own next waypoint independently — no per-tile
         // locking — then overlaps get shoved apart, then anyone who's made
@@ -200,26 +200,26 @@ public static class Program
         // can't clear) gets a fresh route. Together this is what lets a
         // whole group arrive without freezing solid or leaving stragglers
         // parked mid-route.
-        foreach (var pawn in pawns) pawn.Update(dt);
-        ResolveOverlaps(pawns);
-        RepathStuckPawns(map, pawns);
+        foreach (var actor in actors) actor.Update(dt);
+        ResolveOverlaps(actors);
+        RepathStuckActors(map, actors);
     }
 
-    // Soft collision: pushes any pair of pawns that end up closer than two
+    // Soft collision: pushes any pair of actors that end up closer than two
     // radii back apart, split evenly, in the horizontal plane only (height
     // always comes from the terrain). A few relaxation passes keep a knot of
-    // 3+ pawns from jittering instead of settling.
-    static void ResolveOverlaps(List<Pawn> pawns)
+    // 3+ actors from jittering instead of settling.
+    static void ResolveOverlaps(List<Actor> actors)
     {
-        const float MinDist = Pawn.Radius * 2f;
+        const float MinDist = Actor.Radius * 2f;
 
         for (int pass = 0; pass < 3; pass++)
         {
-            for (int i = 0; i < pawns.Count; i++)
+            for (int i = 0; i < actors.Count; i++)
             {
-                for (int j = i + 1; j < pawns.Count; j++)
+                for (int j = i + 1; j < actors.Count; j++)
                 {
-                    Vector3 delta3 = pawns[j].WorldPos - pawns[i].WorldPos;
+                    Vector3 delta3 = actors[j].WorldPos - actors[i].WorldPos;
                     Vector2 delta = new(delta3.X, delta3.Z);
                     float dist = delta.Length();
                     if (dist >= MinDist) continue;
@@ -229,34 +229,34 @@ public static class Program
                     Vector2 pushDir = dist > 0.0001f ? delta / dist : new Vector2(1f, 0f);
                     Vector2 correction = pushDir * ((MinDist - dist) * 0.5f);
 
-                    pawns[i].Nudge(-correction);
-                    pawns[j].Nudge(correction);
+                    actors[i].Nudge(-correction);
+                    actors[j].Nudge(correction);
                 }
             }
         }
     }
 
-    // Anyone who's been stuck for too long (see Pawn.Stuck) gets a brand new
-    // route to the same final destination, re-checking blocking pawns right
+    // Anyone who's been stuck for too long (see Actor.Stuck) gets a brand new
+    // route to the same final destination, re-checking blocking actors right
     // now. Uses Reroute (not SetPath) so repeated failures still count
-    // toward Pawn's own give-up timeout instead of resetting it every try.
+    // toward Actor's own give-up timeout instead of resetting it every try.
     // If no route exists any more, this just leaves them stopped where they are.
-    static void RepathStuckPawns(TileMap map, List<Pawn> pawns)
+    static void RepathStuckActors(TileMap map, List<Actor> actors)
     {
-        foreach (var pawn in pawns)
+        foreach (var actor in actors)
         {
-            if (!pawn.Stuck || pawn.FinalDestination is not { } dest) continue;
+            if (!actor.Stuck || actor.FinalDestination is not { } dest) continue;
 
-            var blockingTiles = BlockingTiles(pawns, except: pawn);
-            var path = AStar.FindPath(map, pawn.TileX, pawn.TileZ, dest.X, dest.Y, PathBlocker(blockingTiles, pawn));
-            pawn.Reroute(path);
+            var blockingTiles = BlockingTiles(actors, except: actor);
+            var path = AStar.FindPath(map, actor.TileX, actor.TileZ, dest.X, dest.Y, PathBlocker(blockingTiles, actor));
+            actor.Reroute(path);
         }
     }
 
     // The gear icon toggles the panel; everything else here only reacts
     // while it's open. Returns true whenever a click landed on the gear
     // icon or somewhere inside the open panel, so that same click doesn't
-    // also fall through to world/pawn selection. A click that closes the
+    // also fall through to world/actor selection. A click that closes the
     // panel by landing *outside* it is deliberately NOT consumed, so it
     // still acts as a normal world click (e.g. clearing selection).
     static bool UpdateSettingsMenu(SunLight sun, SettingsMenuState menu, ref bool showGrid)
@@ -321,7 +321,7 @@ public static class Program
         return false;
     }
 
-    // The action menu only does anything once at least one pawn is selected.
+    // The action menu only does anything once at least one actor is selected.
     // Returns true if a button was actually clicked this frame, so the
     // world-selection click handling below can skip that same click.
     static bool UpdateActionMenu(TileMap map, SelectionState selection)
@@ -333,39 +333,44 @@ public static class Program
 
         if (Raylib.CheckCollisionPointRec(mouse, JumpButtonRect))
         {
-            foreach (var pawn in selection.Selected) pawn.Jump();
+            foreach (var actor in selection.Selected) actor.Jump();
             return true;
         }
 
         if (Raylib.CheckCollisionPointRec(mouse, DigButtonRect))
         {
             // Digs the whole topmost layer at once, capped by whatever room
-            // is left in each pawn's inventory. Silently does nothing for a
-            // pawn that isn't standing on Grass or Dirt, or has no room at
-            // all. No explicit re-snap needed: Pawn.Update re-reads the
+            // is left in each actor's inventory. Silently does nothing for
+            // an actor that isn't standing on Grass or Dirt, or has no room
+            // at all. No explicit re-snap needed: Actor.Update re-reads the
             // ground height under it every frame, so it settles automatically.
-            foreach (var pawn in selection.Selected)
+            foreach (var actor in selection.Selected)
             {
-                int room = pawn.Inventory.Room;
+                int room = actor.Inventory.Room;
                 if (room <= 0) continue;
-                int dug = map.Dig(pawn.TileX, pawn.TileZ, room);
-                if (dug > 0) pawn.Inventory.Add("Dirt", dug);
+                int dug = map.Dig(actor.TileX, actor.TileZ, room);
+                if (dug > 0)
+                {
+                    actor.Inventory.Add("Dirt", dug);
+                    actor.PlayDig();
+                }
             }
             return true;
         }
 
         if (Raylib.CheckCollisionPointRec(mouse, DepositButtonRect))
         {
-            // Silently does nothing for a pawn that doesn't have enough
+            // Silently does nothing for an actor that doesn't have enough
             // carried voxels to top off its current tile's partial level,
             // or whose tile is already at the maximum height.
-            foreach (var pawn in selection.Selected)
+            foreach (var actor in selection.Selected)
             {
-                int needed = map.VoxelsNeededToRaise(pawn.TileX, pawn.TileZ);
-                if (pawn.Inventory.Total < needed) continue;
-                if (map.Deposit(pawn.TileX, pawn.TileZ) == 0) continue;
+                int needed = map.VoxelsNeededToRaise(actor.TileX, actor.TileZ);
+                if (actor.Inventory.Total < needed) continue;
+                if (map.Deposit(actor.TileX, actor.TileZ) == 0) continue;
 
-                pawn.Inventory.TryRemove("Dirt", needed);
+                actor.Inventory.TryRemove("Dirt", needed);
+                actor.PlayDeposit();
             }
             return true;
         }
@@ -373,12 +378,12 @@ public static class Program
         return false;
     }
 
-    // Left-click: select one pawn (or add/toggle with shift), clear selection
+    // Left-click: select one actor (or add/toggle with shift), clear selection
     // on empty ground, or drag out a box to select everyone inside it.
     // uiConsumedClick suppresses all of that for a click the action menu
     // already handled.
     static void UpdateSelection(
-        List<Pawn> pawns, SelectionState selection, Camera3D camera, bool shiftHeld, bool uiConsumedClick)
+        List<Actor> actors, SelectionState selection, Camera3D camera, bool shiftHeld, bool uiConsumedClick)
     {
         if (Raylib.IsMouseButtonPressed(MouseButton.Left) && !uiConsumedClick)
         {
@@ -403,22 +408,22 @@ public static class Program
                     MathF.Abs(end.X - start.X), MathF.Abs(end.Y - start.Y));
 
                 if (!shiftHeld) selection.Selected.Clear();
-                foreach (var pawn in pawns)
+                foreach (var actor in actors)
                 {
-                    Vector2 screenPos = Raylib.GetWorldToScreen(pawn.WorldPos, camera);
+                    Vector2 screenPos = Raylib.GetWorldToScreen(actor.WorldPos, camera);
                     if (Raylib.CheckCollisionPointRec(screenPos, rect))
-                        selection.Selected.Add(pawn);
+                        selection.Selected.Add(actor);
                 }
             }
             else
             {
-                // A plain click: find the nearest pawn under the cursor, if any.
-                Pawn? clicked = null;
+                // A plain click: find the nearest actor under the cursor, if any.
+                Actor? clicked = null;
                 float bestDist = 20f; // pixel pick radius
-                foreach (var pawn in pawns)
+                foreach (var actor in actors)
                 {
-                    float d = Vector2.Distance(Raylib.GetWorldToScreen(pawn.WorldPos, camera), end);
-                    if (d < bestDist) { bestDist = d; clicked = pawn; }
+                    float d = Vector2.Distance(Raylib.GetWorldToScreen(actor.WorldPos, camera), end);
+                    if (d < bestDist) { bestDist = d; clicked = actor; }
                 }
 
                 if (clicked != null)
@@ -444,13 +449,13 @@ public static class Program
             selection.BoxSelecting = false;
         }
 
-        foreach (var pawn in pawns)
-            pawn.Selected = selection.Selected.Contains(pawn);
+        foreach (var actor in actors)
+            actor.Selected = selection.Selected.Contains(actor);
     }
 
     // Right-click (a click, not a camera-orbit drag): send every selected
-    // pawn toward the clicked tile, each to its own nearby free spot.
-    static void UpdateMoveOrders(TileMap map, List<Pawn> pawns, SelectionState selection, Camera3D camera)
+    // actor toward the clicked tile, each to its own nearby free spot.
+    static void UpdateMoveOrders(TileMap map, List<Actor> actors, SelectionState selection, Camera3D camera)
     {
         if (Raylib.IsMouseButtonPressed(MouseButton.Right))
         {
@@ -488,17 +493,17 @@ public static class Program
 
                 if (hitX >= 0 && map.IsWalkable(hitX, hitZ))
                 {
-                    // A direct order always overrides whatever a pawn was
+                    // A direct order always overrides whatever an actor was
                     // doing before, including a give-up — SetPath (not
                     // Reroute) resets its stuck budget for the new attempt.
                     var movers = selection.Selected.ToList();
-                    var blockingTiles = BlockingTiles(pawns);
+                    var blockingTiles = BlockingTiles(actors);
                     var destinations = AssignDestinations(map, movers, hitX, hitZ, blockingTiles);
-                    foreach (var (pawn, dest) in destinations)
+                    foreach (var (actor, dest) in destinations)
                     {
-                        var path = AStar.FindPath(map, pawn.TileX, pawn.TileZ, dest.X, dest.Z,
-                            PathBlocker(blockingTiles, pawn));
-                        pawn.SetPath(path);
+                        var path = AStar.FindPath(map, actor.TileX, actor.TileZ, dest.X, dest.Z,
+                            PathBlocker(blockingTiles, actor));
+                        actor.SetPath(path);
                     }
                 }
             }
@@ -508,45 +513,45 @@ public static class Program
         }
     }
 
-    // Tiles that should be routed around like solid rock: pawns standing
-    // still with no route, AND pawns currently Stuck (moving in name only —
+    // Tiles that should be routed around like solid rock: actors standing
+    // still with no route, AND actors currently Stuck (moving in name only —
     // they haven't actually gone anywhere in a while). Without including
-    // Stuck pawns here, a fresh route (manual or automatic) could plan
+    // Stuck actors here, a fresh route (manual or automatic) could plan
     // straight back through the exact jam it's trying to get out of, which
-    // made it look like re-ordering a stuck pawn did nothing. Pawns making
+    // made it look like re-ordering a stuck actor did nothing. Actors making
     // real progress are left out; they're expected to be elsewhere by the
     // time anyone else gets there.
-    static HashSet<(int X, int Z)> BlockingTiles(List<Pawn> pawns, Pawn? except = null) =>
-        pawns.Where(p => p != except && (!p.IsMoving || p.Stuck)).Select(p => (p.TileX, p.TileZ)).ToHashSet();
+    static HashSet<(int X, int Z)> BlockingTiles(List<Actor> actors, Actor? except = null) =>
+        actors.Where(p => p != except && (!p.IsMoving || p.Stuck)).Select(p => (p.TileX, p.TileZ)).ToHashSet();
 
     // True for a tile standing in for solid ground: occupied by some OTHER
-    // blocking pawn. A pawn is never blocked by its own current tile.
-    static Func<int, int, bool> PathBlocker(HashSet<(int X, int Z)> blockingTiles, Pawn mover) =>
+    // blocking actor. An actor is never blocked by its own current tile.
+    static Func<int, int, bool> PathBlocker(HashSet<(int X, int Z)> blockingTiles, Actor mover) =>
         (x, z) => blockingTiles.Contains((x, z)) && (x, z) != (mover.TileX, mover.TileZ);
 
     // Gives each mover its own nearby walkable tile around the target, so a
     // group order doesn't send everyone to stack on the exact same spot.
-    // Closer pawns claim the closer slots first.
-    static Dictionary<Pawn, (int X, int Z)> AssignDestinations(
-        TileMap map, List<Pawn> movers, int targetX, int targetZ, HashSet<(int X, int Z)> blockingTiles)
+    // Closer actors claim the closer slots first.
+    static Dictionary<Actor, (int X, int Z)> AssignDestinations(
+        TileMap map, List<Actor> movers, int targetX, int targetZ, HashSet<(int X, int Z)> blockingTiles)
     {
         var claimed = new HashSet<(int, int)>();
-        var result = new Dictionary<Pawn, (int, int)>();
+        var result = new Dictionary<Actor, (int, int)>();
 
-        foreach (var pawn in movers.OrderBy(p => Math.Abs(p.TileX - targetX) + Math.Abs(p.TileZ - targetZ)))
+        foreach (var actor in movers.OrderBy(p => Math.Abs(p.TileX - targetX) + Math.Abs(p.TileZ - targetZ)))
         {
-            var tile = FindNearestFreeTile(map, targetX, targetZ, claimed, PathBlocker(blockingTiles, pawn));
+            var tile = FindNearestFreeTile(map, targetX, targetZ, claimed, PathBlocker(blockingTiles, actor));
             if (tile is { } t)
             {
                 claimed.Add(t);
-                result[pawn] = t;
+                result[actor] = t;
             }
         }
         return result;
     }
 
     // Spirals outward ring by ring from (cx, cz) until it finds a walkable
-    // tile nobody else in this order has claimed, and no idle pawn is
+    // tile nobody else in this order has claimed, and no idle actor is
     // already standing on.
     static (int X, int Z)? FindNearestFreeTile(
         TileMap map, int cx, int cz, HashSet<(int, int)> claimed, Func<int, int, bool> blocked)
@@ -572,13 +577,13 @@ public static class Program
         return null; // no free tile anywhere — shouldn't happen in practice
     }
 
-    static void Draw(TileMap map, List<Pawn> pawns, SelectionState selection, SettingsMenuState settingsMenu, Camera3D camera, SunLight sun, bool showGrid)
+    static void Draw(TileMap map, List<Actor> actors, SelectionState selection, SettingsMenuState settingsMenu, Camera3D camera, SunLight sun, bool showGrid)
     {
         // Rendered from the light's point of view into its own depth
         // texture before anything else — the main lit pass right below
         // needs that result (via the shader's shadowMap uniform) already
         // in hand for this same frame.
-        sun.RenderShadowMap(map, pawns);
+        sun.RenderShadowMap(map, actors);
 
         Raylib.BeginDrawing();
         Raylib.ClearBackground(sun.SkyColor);
@@ -596,15 +601,15 @@ public static class Program
         map.DrawTrees();
         map.DrawBushes();
         map.DrawWater();
-        foreach (var pawn in pawns) pawn.DrawSolid();
+        foreach (var actor in actors) actor.DrawSolid();
         sun.EndLit();
 
         // Unlit pass: faint edges on every block so height steps are legible
         // even where the shading alone doesn't make it obvious, plus each
-        // pawn's outline and selection ring. The grid itself is optional —
+        // actor's outline and selection ring. The grid itself is optional —
         // toggled from the settings panel — everything else here isn't.
         if (showGrid) map.DrawOutlines();
-        foreach (var pawn in pawns) pawn.DrawOutline();
+        foreach (var actor in actors) actor.DrawOutline();
 
         Raylib.EndMode3D();
 
@@ -620,7 +625,7 @@ public static class Program
         }
 
         // The HUD is drawn in *screen* space, so it stays put.
-        Raylib.DrawText($"Selected: {selection.Selected.Count}/{pawns.Count}", 10, 10, 18, Color.Black);
+        Raylib.DrawText($"Selected: {selection.Selected.Count}/{actors.Count}", 10, 10, 18, Color.Black);
 
         DrawSettingsMenu(sun, settingsMenu, showGrid);
 
@@ -633,13 +638,13 @@ public static class Program
 
             if (selection.Selected.Count == 1)
             {
-                var pawn = selection.Selected.First();
-                string items = pawn.Inventory.Counts.Count == 0
+                var actor = selection.Selected.First();
+                string items = actor.Inventory.Counts.Count == 0
                     ? "(empty)"
-                    : string.Join(", ", pawn.Inventory.Counts.Select(kv => $"{kv.Key} x{kv.Value}"));
-                int needed = map.VoxelsNeededToRaise(pawn.TileX, pawn.TileZ);
+                    : string.Join(", ", actor.Inventory.Counts.Select(kv => $"{kv.Key} x{kv.Value}"));
+                int needed = map.VoxelsNeededToRaise(actor.TileX, actor.TileZ);
                 Raylib.DrawText(
-                    $"Inventory ({pawn.Inventory.Total}/{Inventory.Capacity}): {items}   " +
+                    $"Inventory ({actor.Inventory.Total}/{Inventory.Capacity}): {items}   " +
                     $"(deposit needs {needed})",
                     300, ScreenHeight - 58, 16, Color.Black);
             }
