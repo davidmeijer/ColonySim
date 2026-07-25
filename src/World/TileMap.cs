@@ -73,36 +73,46 @@ public class TileMap
   readonly int[,] _voxelHeight;
   readonly TileType[,] _voxelTop;
 
-  // Sparse water depth, in (fractional) voxels, per fine column — sitting
+  // Water depth, in (fractional) voxels, per fine column — sitting
   // directly on top of that column's ground (_voxelHeight). Continuous
   // rather than whole-voxel: the terrain is voxel/discrete because that's
   // what makes digging read as real excavation, but water is the opposite
   // case — it should settle to a genuinely level surface, and an integer
   // voxel count can only ever get within one voxel of level before there's
   // nothing left to move. No separate "is this cell open" concept is
-  // needed the way the old coarse 3D water grid needed one: the fine
-  // terrain has no caves or overhangs, it's a plain heightmap, so water
-  // only ever has one place to be at a given (fx, fz) — right on the
-  // surface — and the only way it moves is sideways, flowing toward
-  // whichever neighbour's surface (ground + its water) is lower.
-  readonly Dictionary<(int Fx, int Fz), float> _water = new();
-
-  const float WaterTickInterval = 0.1f;
-  const float WaterEpsilon = 0.01f;
-  const float WaterFlowRate = 0.25f; // fraction of the surface-height difference that equalises per tick
-
-  // Optional continuous spring: if a preset sets one (see
-  // WorldGenerator.Result.HasWaterSource), this many voxels of water are
-  // added at the source every tick, forever, instead of the map only ever
-  // having whatever was seeded at generation time. The current lake preset
-  // doesn't use this — a lake is filled once and left to settle — but the
-  // mechanism stays here ready for a future preset (a river, say) that does.
-  const float SourceFlowRate = 0.3f;
+  // needed the way a 3D water grid would need one: the fine terrain has no
+  // caves or overhangs, it's a plain heightmap, so water only ever has one
+  // place to be at a given (fx, fz) — right on the surface. The solver
+  // itself lives in WaterSim; it's handed _voxelHeight by reference, so
+  // digging a channel is visible to it on the very next tick.
+  readonly WaterSim _waterSim;
   float _waterTimer;
-  bool _hasSource;
-  int _sourceFx, _sourceFz;
 
-  static readonly (int Dx, int Dz)[] HorizontalDirs = { (1, 0), (-1, 0), (0, 1), (0, -1) };
+  // Springs: player-placed, permanent water sources. Each one pushes
+  // SpringFlowRate voxels of water per tick into a small disc around its
+  // tile centre — a disc rather than the single centre column so the
+  // outflow reads as a welling spring instead of a one-voxel jet.
+  //
+  // The rate is the main dial on how the map plays. A spring produces
+  // water forever and only the map's rim takes it away, so anything that
+  // outruns the drainage will eventually flood inland basins; the question
+  // is how long "eventually" is. At 3 a spring on the starting map's high
+  // ground runs a clear river down into the lake and covers about a tenth
+  // of the map after five minutes, which is fast enough to watch happen
+  // and slow enough that capping it stays a real decision. Tripling it
+  // floods a fifth of the map in the same time.
+  const float SpringFlowRate = 3f;
+  const int SpringRadiusVoxels = 3;
+  readonly List<Spring> _springs = new();
+  readonly HashSet<(int X, int Z)> _springTiles = new();
+
+  // The disc a spring feeds, as offsets from its centre column. Precomputed
+  // once since every spring uses the same shape every tick.
+  static readonly (int Dx, int Dz)[] SpringDisc =
+    (from dx in Enumerable.Range(-SpringRadiusVoxels, SpringRadiusVoxels * 2 + 1)
+     from dz in Enumerable.Range(-SpringRadiusVoxels, SpringRadiusVoxels * 2 + 1)
+     where dx * dx + dz * dz <= SpringRadiusVoxels * SpringRadiusVoxels
+     select (dx, dz)).ToArray();
 
   // Trees, scattered in clusters. Tracked by coarse tile: only one per
   // tile, and a tiled tile blocks pathfinding just like rock or deep water
@@ -128,12 +138,21 @@ public class TileMap
 
   // Rendering: one Model per chunk of the fine grid. Tracked per chunk
   // (not one global flag) and rebuilt only where something actually
-  // changed — water alone can dirty a chunk every tick while a stream is
-  // actively spreading over new ground, so rebuilding all ~200 chunks on
-  // every such change would visibly stutter.
+  // changed — an advancing stream muddies fresh ground every tick, so
+  // rebuilding all ~200 chunks on every such change would visibly stutter.
   Shader? _terrainShader;
   readonly Model?[,] _chunkModels;
   readonly bool[,] _chunkDirty;
+
+  // Water gets the same treatment on its own set of chunks, tracked
+  // separately because the two go stale at completely different rates:
+  // terrain only changes when someone digs, whereas flowing water changes
+  // every tick. Drawing water as one cube per wet column (as it used to
+  // be) meant a lake pushed hundreds of thousands of vertices through the
+  // CPU every single frame; as chunked meshes, moving water costs a
+  // rebuild only where it's actually moving, and water that has settled
+  // costs nothing at all beyond one DrawModel per chunk.
+  readonly Model?[,] _waterChunkModels;
 
   int ChunksX => _chunkDirty.GetLength(0);
   int ChunksZ => _chunkDirty.GetLength(1);
@@ -156,6 +175,7 @@ public class TileMap
     int chunksX = (FineWidth + ChunkSize - 1) / ChunkSize;
     int chunksZ = (FineDepth + ChunkSize - 1) / ChunkSize;
     _chunkModels = new Model?[chunksX, chunksZ];
+    _waterChunkModels = new Model?[chunksX, chunksZ];
     _chunkDirty = new bool[chunksX, chunksZ];
     MarkAllChunksDirty();
 
@@ -166,8 +186,9 @@ public class TileMap
     _voxelTop = generated.VoxelTop;
     _dryTime = new float[FineWidth, FineDepth];
 
-    foreach (var (pos, depth2) in generated.Water)
-      _water[pos] = depth2;
+    _waterSim = new WaterSim(FineWidth, FineDepth, _voxelHeight, ChunkSize);
+    foreach (var (pos, waterDepth) in generated.Water)
+      _waterSim.AddWater(pos.Fx, pos.Fz, waterDepth);
 
     foreach (var tree in generated.Trees)
     {
@@ -181,11 +202,10 @@ public class TileMap
       _bushTiles.Add((bush.TileX, bush.TileZ));
     }
 
-    if (generated.HasWaterSource)
+    foreach (var (springX, springZ) in generated.Springs)
     {
-      _hasSource = true;
-      _sourceFx = generated.SourceFx;
-      _sourceFz = generated.SourceFz;
+      _springs.Add(new Spring(springX, springZ));
+      _springTiles.Add((springX, springZ));
     }
   }
 
@@ -194,12 +214,34 @@ public class TileMap
     for (int cx = 0; cx < ChunksX; cx++)
       for (int cz = 0; cz < ChunksZ; cz++)
         _chunkDirty[cx, cz] = true;
+
+    // Null during construction: MarkAllChunksDirty runs once before the
+    // sim exists, and the sim starts with nothing built anyway.
+    _waterSim?.MarkAllChunksDirty();
   }
 
+  // Dirties a fine column's terrain chunk — and its water chunk with it,
+  // since the water surface is drawn at ground + depth, so changing the
+  // ground under standing water moves the water too.
   void MarkChunkDirtyAt(int fx, int fz)
   {
     int cx = fx / ChunkSize, cz = fz / ChunkSize;
     if (cx >= 0 && cz >= 0 && cx < ChunksX && cz < ChunksZ) _chunkDirty[cx, cz] = true;
+    _waterSim.MarkChunkDirtyAt(fx, fz);
+  }
+
+  // For edits that change a column's HEIGHT, as opposed to just the
+  // material on top of it. On top of dirtying the mesh, this wakes the
+  // water sim up at that column: the solver only walks the region water is
+  // currently in, so a channel dug ahead of the waterline has to announce
+  // itself or it wouldn't be looked at until water happened to spread
+  // there on its own. Material-only edits (regrowth, scorching, shoreline
+  // mud) deliberately don't call this — they'd drag the active region out
+  // across the whole map for no reason.
+  void MarkTerrainChangedAt(int fx, int fz)
+  {
+    MarkChunkDirtyAt(fx, fz);
+    _waterSim.Touch(fx, fz);
   }
 
   // Dirt that's currently the exposed, sun-lit top of its column — and has
@@ -241,7 +283,7 @@ public class TileMap
           continue;
         }
 
-        if (_water.TryGetValue((fx, fz), out float w) && w > WaterEpsilon)
+        if (_waterSim.DepthAt(fx, fz) > 0f)
         {
           _dryTime[fx, fz] = 0f;
           continue;
@@ -344,7 +386,7 @@ public class TileMap
         filled++;
         _voxelHeight[fx, fz] = h;
         if (h > 0) _voxelTop[fx, fz] = topMaterial;
-        MarkChunkDirtyAt(fx, fz);
+        MarkTerrainChangedAt(fx, fz);
       }
     }
   }
@@ -391,7 +433,7 @@ public class TileMap
         if (_voxelHeight[fx, fz] != maxH) continue; // only the current top layer
         _voxelHeight[fx, fz] -= 1;
         _voxelTop[fx, fz] = TileType.Dirt;
-        MarkChunkDirtyAt(fx, fz);
+        MarkTerrainChangedAt(fx, fz);
         dug++;
       }
     }
@@ -453,7 +495,7 @@ public class TileMap
     if (_voxelHeight[fx, fz] <= 0) return false;
     var top = _voxelTop[fx, fz];
     if (top != TileType.Grass && top != TileType.Dirt) return false;
-    return !_water.TryGetValue((fx, fz), out float w) || w <= 0f;
+    return _waterSim.DepthAt(fx, fz) <= 0f;
   }
 
   // Whether a specific fine column has room to grow by one more voxel —
@@ -464,7 +506,7 @@ public class TileMap
     if (!InBoundsFine(fx, fz)) return false;
     if (!IsWalkable(fx / FineSubdivisions, fz / FineSubdivisions)) return false;
     if (_voxelHeight[fx, fz] >= MaxHeight * FineSubdivisions) return false;
-    return !_water.TryGetValue((fx, fz), out float w) || w <= 0f;
+    return _waterSim.DepthAt(fx, fz) <= 0f;
   }
 
   // Removes exactly the top voxel of one fine column. Returns 1 on success
@@ -475,7 +517,7 @@ public class TileMap
     if (!CanDigVoxel(fx, fz)) return 0;
     _voxelHeight[fx, fz] -= 1;
     _voxelTop[fx, fz] = TileType.Dirt;
-    MarkChunkDirtyAt(fx, fz);
+    MarkTerrainChangedAt(fx, fz);
     return 1;
   }
 
@@ -485,7 +527,7 @@ public class TileMap
     if (!CanDepositVoxel(fx, fz)) return false;
     _voxelHeight[fx, fz] += 1;
     _voxelTop[fx, fz] = TileType.Dirt;
-    MarkChunkDirtyAt(fx, fz);
+    MarkTerrainChangedAt(fx, fz);
     return true;
   }
 
@@ -651,8 +693,17 @@ public class TileMap
   {
     if (!InBounds(x, z)) return 0f;
     var (fx, fz) = FineCenter(x, z);
-    return _water.TryGetValue((fx, fz), out float v) ? v : 0f;
+    return _waterSim.DepthAt(fx, fz);
   }
+
+  // A single fine column's water depth — what the water mesh builder and
+  // the debug readout want, as opposed to WaterDepth's coarse-tile sample.
+  public float WaterDepthFine(int fx, int fz) => _waterSim.DepthAt(fx, fz);
+
+  // Total water on the map, in voxel-volumes — surfaced in the HUD so it's
+  // obvious at a glance whether springs are outpacing what drains off the
+  // rim, or whether a basin is still filling.
+  public float TotalWaterVolume() => _waterSim.TotalVolume();
 
   // Bare rock faces block movement, so does water too deep to wade, and so
   // does a tree, a bush, or a lit campfire — you can't walk through a
@@ -701,88 +752,47 @@ public class TileMap
     return _voxelHeight[fx, fz] * VoxelSize;
   }
 
-  // --- Water simulation (fine grid, continuous depth): if a preset set a
-  // continuous spring (see SourceFlowRate), it keeps adding water at the
-  // source every tick — the lake preset doesn't, so this is a no-op for it.
-  // Every water-bearing column then checks its 4 neighbours and flows a
-  // fraction (WaterFlowRate) of the surface-height difference toward any
-  // neighbour whose own surface (ground + its water) is lower — repeated
-  // ticks asymptotically level the surface out, genuinely flat rather than
-  // stuck a voxel short the way whole-voxel spilling would be. A neighbour
-  // off the edge of the map is treated as a bottomless drain (surface 0):
-  // water that flows that way is simply discarded, so water reaching the
-  // map boundary drains away instead of pooling there forever. There's no
-  // separate "falling" phase the way the old coarse 3D water grid needed:
-  // the fine terrain is a plain heightmap, so water only ever has one
-  // place to sit at a given (fx, fz) — directly on the surface — and
-  // flowing sideways is the only way it moves.
+  // --- Water ------------------------------------------------------------
+  //
+  // The solver itself is WaterSim; this is just the driver. Each tick the
+  // springs push their water in, the sim steps, and any column that went
+  // from dry to wet muddies the grass around it.
 
   public void UpdateWater(float dt)
   {
     _waterTimer += dt;
-    while (_waterTimer >= WaterTickInterval)
+    while (_waterTimer >= WaterSim.TickInterval)
     {
-      _waterTimer -= WaterTickInterval;
-      StepWater();
+      _waterTimer -= WaterSim.TickInterval;
+
+      foreach (var spring in _springs)
+      {
+        var (cfx, cfz) = FineCenter(spring.TileX, spring.TileZ);
+        float perColumn = SpringFlowRate / SpringDisc.Length;
+        foreach (var (dx, dz) in SpringDisc)
+          _waterSim.AddWater(cfx + dx, cfz + dz, perColumn);
+      }
+
+      _waterSim.Step();
+      MudNewShorelines();
     }
   }
 
   // How far the muddying effect of standing/flowing water reaches beyond
-  // the tiles it's actually sitting on — a shoreline, not just the
+  // the columns it's actually sitting on — a shoreline, not just the
   // waterline itself.
   const int MudRadius = 5;
 
-  void StepWater()
+  // Water washes grass to mud in a radius around it. Driven off the sim's
+  // newly-wet list rather than off every wet column: re-walking an 11x11
+  // neighbourhood around every column of a large lake, every tick, was
+  // close to a million iterations a tick for something that has nothing
+  // left to do after the lake's first tick. A column only enters this list
+  // the tick it actually becomes wet, so a settled lake costs nothing and
+  // an advancing stream costs only its own front.
+  void MudNewShorelines()
   {
-    if (_hasSource)
-    {
-      var sourcePos = (_sourceFx, _sourceFz);
-      _water.TryGetValue(sourcePos, out float current);
-      _water[sourcePos] = current + SourceFlowRate;
-    }
-
-    if (_water.Count == 0) return;
-
-    var next = new Dictionary<(int Fx, int Fz), float>(_water);
-
-    foreach (var pos in _water.Keys)
-    {
-      var (fx, fz) = pos;
-      if (!next.TryGetValue(pos, out float amount) || amount <= WaterEpsilon) continue;
-
-      foreach (var (dx, dz) in HorizontalDirs)
-      {
-        if (amount <= WaterEpsilon) break;
-
-        int nfx = fx + dx, nfz = fz + dz;
-        bool offMap = nfx < 0 || nfz < 0 || nfx >= FineWidth || nfz >= FineDepth;
-
-        float neighborWater = 0f;
-        var npos = (nfx, nfz);
-        if (!offMap) next.TryGetValue(npos, out neighborWater);
-
-        float mySurface = _voxelHeight[fx, fz] + amount;
-        float neighborSurface = offMap ? 0f : _voxelHeight[nfx, nfz] + neighborWater;
-        float diff = mySurface - neighborSurface;
-        if (diff <= WaterEpsilon) continue;
-
-        float flow = MathF.Min(diff * WaterFlowRate, amount);
-        amount -= flow;
-        next[pos] = amount;
-        if (!offMap) next[npos] = neighborWater + flow; // otherwise it just drains off the map
-      }
-    }
-
-    _water.Clear();
-    foreach (var (pos, amount) in next)
-      if (amount > WaterEpsilon) _water[pos] = amount;
-
-    // Standing or flowing water washes grass to mud — not just where it's
-    // actually sitting, but in a radius around it, like a muddy shoreline.
-    // Only iterates around the (typically modest) set of wet columns, not
-    // the whole map, and skips columns that are already Dirt, so a settled
-    // lake costs almost nothing here after its first tick.
-    foreach (var (fx, fz) in _water.Keys)
+    foreach (var (fx, fz) in _waterSim.NewlyWet)
     {
       for (int dx = -MudRadius; dx <= MudRadius; dx++)
       {
@@ -798,6 +808,51 @@ public class TileMap
         }
       }
     }
+  }
+
+  // --- Springs ------------------------------------------------------------
+
+  public IReadOnlyList<Spring> Springs => _springs;
+
+  // Same siting rule as a campfire — ordinary open ground, nothing already
+  // on it — except that a spring is allowed on wet ground. Placing one in
+  // a pond to raise its level is a perfectly reasonable thing to want, and
+  // unlike a fire there is nothing about a spring that water ruins.
+  public bool CanPlaceSpring(int x, int z) =>
+    InBounds(x, z) &&
+    TopMaterial(x, z) != TileType.Rock &&
+    !_treeTiles.Contains((x, z)) &&
+    !_bushTiles.Contains((x, z)) &&
+    !_campfireTiles.Contains((x, z)) &&
+    !_springTiles.Contains((x, z));
+
+  public Spring? PlaceSpring(int x, int z)
+  {
+    if (!CanPlaceSpring(x, z)) return null;
+
+    var spring = new Spring(x, z);
+    _springs.Add(spring);
+    _springTiles.Add((x, z));
+
+    // Wake the sim at the spring's own column, so its first tick of water
+    // is simulated even if it was placed nowhere near any existing water.
+    var (fx, fz) = FineCenter(x, z);
+    _waterSim.Touch(fx, fz);
+    return spring;
+  }
+
+  // Caps a spring. The water it already produced is left exactly where it
+  // is: it drains off the map rim if it can reach one, and otherwise just
+  // sits there like any other pond. That's the point of being able to cap
+  // one — it stops the supply, it doesn't undo the flood.
+  public bool RemoveSpring(int x, int z)
+  {
+    int index = _springs.FindIndex(s => s.TileX == x && s.TileZ == z);
+    if (index < 0) return false;
+
+    _springs.RemoveAt(index);
+    _springTiles.Remove((x, z));
+    return true;
   }
 
   // --- Drawing ---
@@ -1152,22 +1207,213 @@ public class TileMap
   {
     foreach (var model in _chunkModels)
       if (model is { } m) Raylib.UnloadModel(m);
+    foreach (var model in _waterChunkModels)
+      if (model is { } m) Raylib.UnloadModel(m);
   }
+
+  // --- Water rendering ---
+  //
+  // Same chunked-mesh approach as the terrain, for the same reason, but
+  // with two differences that come from water being a fluid rather than a
+  // solid: a column's top face sits at ground + depth (so it moves as the
+  // water does), and side faces are only drawn down to whatever the
+  // NEIGHBOUR's surface is, not down to the ground. That second part is
+  // what stops a lake being drawn as thousands of individual submerged
+  // cube walls — inside a body of water every neighbour is at the same
+  // surface height, so no side faces are generated at all and only the
+  // rim of the water gets walls.
+
+  // Water thinner than this isn't drawn: a film a thousandth of a voxel
+  // deep is invisible anyway, and its top face would z-fight with the
+  // ground directly underneath it.
+  const float MinRenderDepth = 0.05f;
+
+  // Shallow water is nearly clear and shows the mud through it; deep water
+  // is darker and hides it. Depth is measured against DepthForFullColor,
+  // past which it stops getting any darker.
+  const float DepthForFullColor = 6f;
+  static readonly Color ShallowWater = new(112, 178, 226, 120);
+  static readonly Color DeepWater = new(38, 96, 176, 225);
+
+  static Color WaterColorFor(float depth)
+  {
+    float t = Math.Clamp(depth / DepthForFullColor, 0f, 1f);
+    return new Color(
+      (byte)(ShallowWater.R + (DeepWater.R - ShallowWater.R) * t),
+      (byte)(ShallowWater.G + (DeepWater.G - ShallowWater.G) * t),
+      (byte)(ShallowWater.B + (DeepWater.B - ShallowWater.B) * t),
+      (byte)(ShallowWater.A + (DeepWater.A - ShallowWater.A) * t));
+  }
+
+  // The height a neighbouring column's water surface presents to this one.
+  // Off the map it's just the ground, so water at the rim is drawn with a
+  // proper wall on that side rather than being clipped flat.
+  float NeighborWaterSurface(int fx, int fz) =>
+    InBoundsFine(fx, fz) ? _voxelHeight[fx, fz] + _waterSim.DepthAt(fx, fz) : 0f;
 
   public void DrawWater()
   {
-    foreach (var ((fx, fz), depth) in _water)
+    RebuildDirtyWaterChunks();
+
+    // Water is translucent, so it must not write depth: two chunks'
+    // surfaces overlapping on screen would otherwise let whichever drew
+    // first stop the other from blending at all, leaving visible seams
+    // along chunk boundaries. Depth TESTING stays on, so water still gets
+    // correctly hidden behind terrain and actors in front of it.
+    Rlgl.DrawRenderBatchActive();
+    Rlgl.DisableDepthMask();
+
+    foreach (var model in _waterChunkModels)
+      if (model is { } m) Raylib.DrawModel(m, Vector3.Zero, 1f, Color.White);
+
+    Rlgl.DrawRenderBatchActive();
+    Rlgl.EnableDepthMask();
+  }
+
+  void RebuildDirtyWaterChunks()
+  {
+    for (int cz = 0; cz < ChunksZ; cz++)
     {
-      if (depth <= 0f) continue;
+      for (int cx = 0; cx < ChunksX; cx++)
+      {
+        if (!_waterSim.IsChunkDirty(cx, cz)) continue;
 
-      float bottomY = _voxelHeight[fx, fz] * VoxelSize;
-      float cubeHeight = depth * VoxelSize;
-      Vector3 center = new(
-        fx * VoxelSize + VoxelSize / 2f,
-        bottomY + cubeHeight / 2f,
-        fz * VoxelSize + VoxelSize / 2f);
+        int fx0 = cx * ChunkSize, fz0 = cz * ChunkSize;
+        int fxCount = Math.Min(ChunkSize, FineWidth - fx0);
+        int fzCount = Math.Min(ChunkSize, FineDepth - fz0);
 
-      Raylib.DrawCube(center, VoxelSize * 0.98f, cubeHeight, VoxelSize * 0.98f, new Color(64, 130, 220, 190));
+        if (_waterChunkModels[cx, cz] is { } old) Raylib.UnloadModel(old);
+        _waterChunkModels[cx, cz] = BuildWaterChunkModel(fx0, fz0, fxCount, fzCount);
+        _waterSim.MarkChunkRendered(cx, cz);
+      }
+    }
+  }
+
+  unsafe Model? BuildWaterChunkModel(int fx0, int fz0, int fxCount, int fzCount)
+  {
+    var verts = new List<Vector3>();
+    var norms = new List<Vector3>();
+    var cols = new List<Color>();
+    var indices = new List<ushort>();
+
+    // Same winding convention as BuildChunkModel — see the note there.
+    void AddQuad(Vector3 a, Vector3 b, Vector3 c, Vector3 d, Color color, Vector3 normal)
+    {
+      ushort baseIndex = (ushort)verts.Count;
+      verts.Add(a); verts.Add(b); verts.Add(c); verts.Add(d);
+      for (int i = 0; i < 4; i++) { norms.Add(normal); cols.Add(color); }
+      indices.Add(baseIndex); indices.Add((ushort)(baseIndex + 2)); indices.Add((ushort)(baseIndex + 1));
+      indices.Add(baseIndex); indices.Add((ushort)(baseIndex + 3)); indices.Add((ushort)(baseIndex + 2));
+    }
+
+    for (int fz = fz0; fz < fz0 + fzCount; fz++)
+    {
+      for (int fx = fx0; fx < fx0 + fxCount; fx++)
+      {
+        float depth = _waterSim.DepthAt(fx, fz);
+        if (depth < MinRenderDepth) continue;
+
+        float groundY = _voxelHeight[fx, fz];
+        float surface = groundY + depth;
+        var color = WaterColorFor(depth);
+
+        float x0 = fx * VoxelSize, x1 = (fx + 1) * VoxelSize;
+        float z0 = fz * VoxelSize, z1 = (fz + 1) * VoxelSize;
+        float topY = surface * VoxelSize;
+
+        AddQuad(
+          new Vector3(x0, topY, z0), new Vector3(x1, topY, z0),
+          new Vector3(x1, topY, z1), new Vector3(x0, topY, z1),
+          color, new Vector3(0, 1, 0));
+
+        // A side wall spans from this column's own surface down to
+        // whatever the neighbour presents — its own water surface if it's
+        // wet (usually equal, so nothing is drawn), or its bare ground if
+        // it's dry or lower. Clamped to this column's ground so the wall
+        // never extends below the bed the water is sitting on.
+        void AddSide(int nfx, int nfz, Vector3 a, Vector3 b, Vector3 normal)
+        {
+          float bottom = Math.Clamp(NeighborWaterSurface(nfx, nfz), groundY, surface);
+          if (surface - bottom < 1e-4f) return;
+
+          float bottomY = bottom * VoxelSize;
+          AddQuad(
+            a with { Y = topY }, b with { Y = topY },
+            b with { Y = bottomY }, a with { Y = bottomY },
+            color, normal);
+        }
+
+        AddSide(fx - 1, fz, new Vector3(x0, 0, z0), new Vector3(x0, 0, z1), new Vector3(-1, 0, 0));
+        AddSide(fx + 1, fz, new Vector3(x1, 0, z1), new Vector3(x1, 0, z0), new Vector3(1, 0, 0));
+        AddSide(fx, fz - 1, new Vector3(x1, 0, z0), new Vector3(x0, 0, z0), new Vector3(0, 0, -1));
+        AddSide(fx, fz + 1, new Vector3(x0, 0, z1), new Vector3(x1, 0, z1), new Vector3(0, 0, 1));
+      }
+    }
+
+    if (verts.Count == 0) return null;
+
+    int vertexCount = verts.Count;
+    int triangleCount = indices.Count / 3;
+
+    var mesh = new Mesh { VertexCount = vertexCount, TriangleCount = triangleCount };
+    mesh.Vertices = (float*)NativeMemory.Alloc((nuint)(vertexCount * 3 * sizeof(float)));
+    mesh.Normals = (float*)NativeMemory.Alloc((nuint)(vertexCount * 3 * sizeof(float)));
+    mesh.Colors = (byte*)NativeMemory.Alloc((nuint)(vertexCount * 4));
+    mesh.Indices = (ushort*)NativeMemory.Alloc((nuint)(indices.Count * sizeof(ushort)));
+
+    for (int i = 0; i < vertexCount; i++)
+    {
+      mesh.Vertices[i * 3 + 0] = verts[i].X;
+      mesh.Vertices[i * 3 + 1] = verts[i].Y;
+      mesh.Vertices[i * 3 + 2] = verts[i].Z;
+
+      mesh.Normals[i * 3 + 0] = norms[i].X;
+      mesh.Normals[i * 3 + 1] = norms[i].Y;
+      mesh.Normals[i * 3 + 2] = norms[i].Z;
+
+      // Unlike the terrain's, this alpha is meaningful — the lit shader
+      // passes fragColor.a straight through to its output.
+      mesh.Colors[i * 4 + 0] = cols[i].R;
+      mesh.Colors[i * 4 + 1] = cols[i].G;
+      mesh.Colors[i * 4 + 2] = cols[i].B;
+      mesh.Colors[i * 4 + 3] = cols[i].A;
+    }
+    for (int i = 0; i < indices.Count; i++) mesh.Indices[i] = indices[i];
+
+    Raylib.UploadMesh(ref mesh, false);
+    var model = Raylib.LoadModelFromMesh(mesh);
+    if (_terrainShader is { } shader) model.Materials[0].Shader = shader;
+    return model;
+  }
+
+  // A spring: a ring of stones around a dark, wet mouth, sitting a touch
+  // above the ground so it stays visible once its own water pools over it.
+  const float SpringRingRadius = TileSize * 0.3f;
+  const int SpringStoneCount = 8;
+  static readonly Color SpringStoneColor = new(122, 128, 134, 255);
+  static readonly Color SpringMouthColor = new(30, 78, 128, 255);
+
+  public void DrawSpringsLit()
+  {
+    foreach (var spring in _springs)
+    {
+      float worldX = spring.TileX * TileSize + TileSize / 2f;
+      float worldZ = spring.TileZ * TileSize + TileSize / 2f;
+      float baseY = SmoothSurfaceY(worldX, worldZ);
+
+      Raylib.DrawCube(
+        new Vector3(worldX, baseY + TileSize * 0.05f, worldZ),
+        TileSize * 0.42f, TileSize * 0.1f, TileSize * 0.42f, SpringMouthColor);
+
+      for (int i = 0; i < SpringStoneCount; i++)
+      {
+        float a = i / (float)SpringStoneCount * MathF.Tau;
+        Vector3 stonePos = new(
+          worldX + MathF.Cos(a) * SpringRingRadius,
+          baseY + TileSize * 0.08f,
+          worldZ + MathF.Sin(a) * SpringRingRadius);
+        Raylib.DrawCube(stonePos, TileSize * 0.15f, TileSize * 0.16f, TileSize * 0.15f, SpringStoneColor);
+      }
     }
   }
 

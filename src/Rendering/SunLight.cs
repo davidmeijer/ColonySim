@@ -397,6 +397,7 @@ public class SunLight
     map.DrawTrees();
     map.DrawBushes();
     map.DrawCampfiresLit();
+    map.DrawSpringsLit();
     foreach (var actor in actors) actor.DrawShadowCaster();
     Raylib.EndShaderMode();
     Raylib.EndMode3D();

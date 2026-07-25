@@ -42,11 +42,13 @@ public class WorkQueue
     TaskKind.Deposit => !map.CanDepositVoxel(t.FineX, t.FineZ),
     TaskKind.BuildCampfire => map.Campfires.Any(f => f.TileX == t.TileX && f.TileZ == t.TileZ),
     TaskKind.DemolishCampfire => !map.Campfires.Any(f => f.TileX == t.TileX && f.TileZ == t.TileZ),
+    TaskKind.BuildSpring => map.Springs.Any(s => s.TileX == t.TileX && s.TileZ == t.TileZ),
+    TaskKind.DemolishSpring => !map.Springs.Any(s => s.TileX == t.TileX && s.TileZ == t.TileZ),
     _ => false,
   };
 
-  // Whether a task's precondition is met right now — Dig/BuildCampfire/
-  // DemolishCampfire have none beyond "still a valid target", but Deposit
+  // Whether a task's precondition is met right now — every kind but one
+  // has none beyond "still a valid target". Deposit is the exception: it
   // needs at least one unit of material already sitting in the global pool
   // before it's worth sending a builder over.
   public static bool IsClaimable(WorkTask t, TileMap map, Inventory globalInventory)
@@ -59,6 +61,8 @@ public class WorkQueue
       TaskKind.Deposit => map.CanDepositVoxel(t.FineX, t.FineZ) && globalInventory.Has("Dirt", 1),
       TaskKind.BuildCampfire => map.CanPlaceCampfire(t.TileX, t.TileZ),
       TaskKind.DemolishCampfire => true,
+      TaskKind.BuildSpring => map.CanPlaceSpring(t.TileX, t.TileZ),
+      TaskKind.DemolishSpring => true,
       _ => false,
     };
   }

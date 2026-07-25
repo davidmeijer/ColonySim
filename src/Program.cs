@@ -86,20 +86,22 @@ public static class Program
     static readonly Rectangle BuildButtonRect = new(260, 10, 36, 36);
 
     // Which tool (if any) is currently armed from the build palette.
-    enum ToolKind { None, Campfire, DemolishCampfire, Dig, Deposit }
+    enum ToolKind { None, Campfire, DemolishCampfire, Spring, DemolishSpring, Dig, Deposit }
 
     const float BuildPanelWidth = 150f;
     const float BuildPanelX = 260f;
     const float BuildPanelY = 56f;
-    const int BuildPaletteRows = 4;
+    const int BuildPaletteRows = 6;
     const float BuildRowHeight = 46f;
     static readonly Rectangle BuildPanelRect = new(BuildPanelX, BuildPanelY, BuildPanelWidth, 8f + BuildPaletteRows * BuildRowHeight);
 
     static Rectangle BuildPaletteItemRect(int row) => new(BuildPanelX + 8, BuildPanelY + 8 + row * BuildRowHeight, BuildPanelWidth - 16, 38);
     static readonly Rectangle CampfireItemRect = BuildPaletteItemRect(0);
     static readonly Rectangle DemolishCampfireItemRect = BuildPaletteItemRect(1);
-    static readonly Rectangle DigItemRect = BuildPaletteItemRect(2);
-    static readonly Rectangle DepositItemRect = BuildPaletteItemRect(3);
+    static readonly Rectangle SpringItemRect = BuildPaletteItemRect(2);
+    static readonly Rectangle DemolishSpringItemRect = BuildPaletteItemRect(3);
+    static readonly Rectangle DigItemRect = BuildPaletteItemRect(4);
+    static readonly Rectangle DepositItemRect = BuildPaletteItemRect(5);
 
     class BuildMenuState
     {
@@ -147,6 +149,11 @@ public static class Program
     const float DepositVoxelDuration = 0.15f;
     const float BuildCampfireDuration = 1.5f;
     const float DemolishCampfireDuration = 1f;
+
+    // Digging down to the water table is real work, so a spring takes
+    // noticeably longer to open than a campfire takes to lay.
+    const float BuildSpringDuration = 4f;
+    const float DemolishSpringDuration = 2f;
 
     // Safety clamp on a single drag-select's footprint (Dig/Deposit) — the
     // queue and per-frame builder scans are all O(task count), so a stray
@@ -463,7 +470,7 @@ public static class Program
     // (deposit-lean) pose or the destructive (dig-chop) one.
     static bool IsConstructive(WorkTask task) => task.Kind switch
     {
-        TaskKind.BuildCampfire or TaskKind.Deposit => true,
+        TaskKind.BuildCampfire or TaskKind.BuildSpring or TaskKind.Deposit => true,
         _ => false,
     };
 
@@ -476,6 +483,8 @@ public static class Program
         TaskKind.Deposit => CompleteDeposit(task, map, globalInventory),
         TaskKind.BuildCampfire => map.PlaceCampfire(task.TileX, task.TileZ) != null,
         TaskKind.DemolishCampfire => map.RemoveCampfire(task.TileX, task.TileZ),
+        TaskKind.BuildSpring => map.PlaceSpring(task.TileX, task.TileZ) != null,
+        TaskKind.DemolishSpring => map.RemoveSpring(task.TileX, task.TileZ),
         _ => true,
     };
 
@@ -937,6 +946,8 @@ public static class Program
         {
             if (Raylib.CheckCollisionPointRec(mouse, CampfireItemRect)) { menu.ArmedTool = ToolKind.Campfire; menu.Open = false; return true; }
             if (Raylib.CheckCollisionPointRec(mouse, DemolishCampfireItemRect)) { menu.ArmedTool = ToolKind.DemolishCampfire; menu.Open = false; return true; }
+            if (Raylib.CheckCollisionPointRec(mouse, SpringItemRect)) { menu.ArmedTool = ToolKind.Spring; menu.Open = false; return true; }
+            if (Raylib.CheckCollisionPointRec(mouse, DemolishSpringItemRect)) { menu.ArmedTool = ToolKind.DemolishSpring; menu.Open = false; return true; }
             if (Raylib.CheckCollisionPointRec(mouse, DigItemRect)) { menu.ArmedTool = ToolKind.Dig; menu.Open = false; return true; }
             if (Raylib.CheckCollisionPointRec(mouse, DepositItemRect)) { menu.ArmedTool = ToolKind.Deposit; menu.Open = false; return true; }
 
@@ -948,15 +959,15 @@ public static class Program
         return false;
     }
 
-    // Applies Campfire/DemolishCampfire (the two coarse-tile tools) to the
+    // Applies the coarse-tile tools (the campfire and spring pairs) to the
     // tile under the mouse — queuing a WorkTask on success, doing nothing
-    // on an invalid tile. Disarms afterward only for Campfire;
-    // DemolishCampfire stays armed for repeated stamping.
+    // on an invalid tile. Disarms afterward only for the two build tools;
+    // the demolish tools stay armed for repeated stamping.
     static void TryPlaceArmedTool(TileMap map, WorkQueue workQueue, BuildMenuState menu, Camera3D camera)
     {
         if (!TryPickTile(map, camera, Raylib.GetMousePosition(), out int tx, out int tz))
         {
-            if (menu.ArmedTool == ToolKind.Campfire) menu.ArmedTool = ToolKind.None;
+            if (menu.ArmedTool is ToolKind.Campfire or ToolKind.Spring) menu.ArmedTool = ToolKind.None;
             return;
         }
 
@@ -964,7 +975,7 @@ public static class Program
         {
             case ToolKind.Campfire:
                 if (map.CanPlaceCampfire(tx, tz))
-                    workQueue.Enqueue(WorkTask.ForCampfire(TaskKind.BuildCampfire, tx, tz, tx, tz, BuildCampfireDuration));
+                    workQueue.Enqueue(WorkTask.ForTile(TaskKind.BuildCampfire, tx, tz, tx, tz, BuildCampfireDuration));
                 menu.ArmedTool = ToolKind.None;
                 break;
 
@@ -972,8 +983,21 @@ public static class Program
                 if (map.Campfires.Any(f => f.TileX == tx && f.TileZ == tz) &&
                     NearestWalkableNeighbor(map, tx, tz) is { } stand)
                 {
-                    workQueue.Enqueue(WorkTask.ForCampfire(TaskKind.DemolishCampfire, tx, tz, stand.X, stand.Z, DemolishCampfireDuration));
+                    workQueue.Enqueue(WorkTask.ForTile(TaskKind.DemolishCampfire, tx, tz, stand.X, stand.Z, DemolishCampfireDuration));
                 }
+                break;
+
+            // Unlike a campfire, a spring doesn't block its own tile, so
+            // the worker stands right on it for both building and capping.
+            case ToolKind.Spring:
+                if (map.CanPlaceSpring(tx, tz))
+                    workQueue.Enqueue(WorkTask.ForTile(TaskKind.BuildSpring, tx, tz, tx, tz, BuildSpringDuration));
+                menu.ArmedTool = ToolKind.None;
+                break;
+
+            case ToolKind.DemolishSpring:
+                if (map.Springs.Any(s => s.TileX == tx && s.TileZ == tz))
+                    workQueue.Enqueue(WorkTask.ForTile(TaskKind.DemolishSpring, tx, tz, tx, tz, DemolishSpringDuration));
                 break;
         }
     }
@@ -1150,8 +1174,14 @@ public static class Program
         map.DrawTrees();
         map.DrawBushes();
         map.DrawCampfiresLit();
-        map.DrawWater();
+        map.DrawSpringsLit();
         foreach (var actor in actors) actor.DrawSolid(showPathDots);
+
+        // Water goes last in the lit pass: it's the only translucent thing
+        // in the scene, so everything it might tint — terrain, springs, an
+        // actor wading through it — has to already be in the buffer for
+        // the blend to have anything to blend against.
+        map.DrawWater();
         sun.EndLit();
 
         // Unlit pass: faint edges on every block so height steps are legible
@@ -1173,13 +1203,23 @@ public static class Program
         // tool is armed: orange for Campfire (matching its previous
         // colour), blue-ish for Dig/Deposit, red whenever the hovered spot
         // isn't a legal target — so the player knows before clicking.
-        if (buildMenu.ArmedTool is ToolKind.Campfire or ToolKind.DemolishCampfire &&
+        if (buildMenu.ArmedTool is ToolKind.Campfire or ToolKind.DemolishCampfire or ToolKind.Spring or ToolKind.DemolishSpring &&
             TryPickTile(map, camera, Raylib.GetMousePosition(), out int hoverX, out int hoverZ))
         {
-            bool valid = buildMenu.ArmedTool == ToolKind.Campfire
-                ? map.CanPlaceCampfire(hoverX, hoverZ)
-                : map.Campfires.Any(f => f.TileX == hoverX && f.TileZ == hoverZ);
-            Color ringColor = valid ? new Color(255, 170, 60, 220) : new Color(220, 60, 60, 220);
+            bool valid = buildMenu.ArmedTool switch
+            {
+                ToolKind.Campfire => map.CanPlaceCampfire(hoverX, hoverZ),
+                ToolKind.Spring => map.CanPlaceSpring(hoverX, hoverZ),
+                ToolKind.DemolishSpring => map.Springs.Any(s => s.TileX == hoverX && s.TileZ == hoverZ),
+                _ => map.Campfires.Any(f => f.TileX == hoverX && f.TileZ == hoverZ),
+            };
+
+            // Springs preview blue rather than the campfire's orange —
+            // they're the one build tool whose whole point is water.
+            bool watery = buildMenu.ArmedTool is ToolKind.Spring or ToolKind.DemolishSpring;
+            Color ringColor = valid
+                ? (watery ? new Color(80, 170, 255, 220) : new Color(255, 170, 60, 220))
+                : new Color(220, 60, 60, 220);
 
             Vector3 ringCenter = new(
                 hoverX * TileMap.TileSize + TileMap.TileSize / 2f,
@@ -1234,6 +1274,13 @@ public static class Program
             : string.Join(", ", globalInventory.Counts.Select(kv => $"{kv.Key} x{kv.Value}"));
         Raylib.DrawText($"Selected: {selection.Selected.Count}/{actors.Count}", 10, 10, 18, Color.Black);
         Raylib.DrawText($"Global inventory: {globalItems}", 10, 32, 16, Color.Black);
+
+        // Total water and how many springs are feeding it. Springs run
+        // forever and only the map's rim drains, so watching this number
+        // is how the player tells a river that's found its level from one
+        // that's still quietly filling a basin somewhere.
+        Raylib.DrawText($"Water: {map.TotalWaterVolume():N0}  ({map.Springs.Count} spring{(map.Springs.Count == 1 ? "" : "s")})",
+            10, 52, 16, Color.Black);
 
         DrawSettingsMenu(sun, settingsMenu, showGrid, showPathDots);
         DrawBuildMenu(buildMenu);
@@ -1394,6 +1441,8 @@ public static class Program
             {
                 ToolKind.Campfire => "Click a tile to place the campfire (Esc / right-click to cancel)",
                 ToolKind.DemolishCampfire => "Click a campfire to demolish it (Esc / right-click to cancel)",
+                ToolKind.Spring => "Click a tile to dig a spring there (Esc / right-click to cancel)",
+                ToolKind.DemolishSpring => "Click a spring to cap it (Esc / right-click to cancel)",
                 ToolKind.Dig or ToolKind.Deposit => "Click a voxel, or drag to select several (Esc / right-click to cancel)",
                 _ => "",
             };
@@ -1407,6 +1456,8 @@ public static class Program
         Raylib.DrawRectangleLinesEx(BuildPanelRect, 1.5f, Color.DarkGray);
         DrawButton(CampfireItemRect, "Campfire");
         DrawButton(DemolishCampfireItemRect, "Demolish Fire");
+        DrawButton(SpringItemRect, "Spring");
+        DrawButton(DemolishSpringItemRect, "Cap Spring");
         DrawButton(DigItemRect, "Dig");
         DrawButton(DepositItemRect, "Deposit");
     }

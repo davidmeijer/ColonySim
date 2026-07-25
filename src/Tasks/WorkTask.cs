@@ -64,11 +64,11 @@ public class WorkTask
     return new WorkTask(kind, tileX, tileZ, tileX, tileZ, fineX, fineZ, duration);
   }
 
-  // BuildCampfire/DemolishCampfire: targets a whole coarse tile; FineX/FineZ
-  // are unused. standX/standZ is usually the same tile (BuildCampfire) but
-  // can be an adjacent one (DemolishCampfire, since the fire itself blocks
-  // its own tile).
-  public static WorkTask ForCampfire(TaskKind kind, int tileX, int tileZ, int standX, int standZ, float duration) =>
+  // The whole-tile kinds (the campfire and spring pairs): FineX/FineZ are
+  // unused. standX/standZ is usually the same tile, but can be an adjacent
+  // one for demolition work whose target tile blocks itself (a campfire
+  // stands on its own tile).
+  public static WorkTask ForTile(TaskKind kind, int tileX, int tileZ, int standX, int standZ, float duration) =>
     new(kind, tileX, tileZ, standX, standZ, fineX: 0, fineZ: 0, duration);
 
   // Human-readable label for the task queue panel.
@@ -78,6 +78,8 @@ public class WorkTask
     TaskKind.Deposit => $"Deposit voxel ({FineX},{FineZ})",
     TaskKind.BuildCampfire => $"Build campfire ({TileX},{TileZ})",
     TaskKind.DemolishCampfire => $"Demolish campfire ({TileX},{TileZ})",
+    TaskKind.BuildSpring => $"Dig spring ({TileX},{TileZ})",
+    TaskKind.DemolishSpring => $"Cap spring ({TileX},{TileZ})",
     _ => Kind.ToString(),
   };
 }

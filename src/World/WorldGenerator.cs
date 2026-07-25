@@ -16,16 +16,15 @@ public static class WorldGenerator
     public required List<Bush> Bushes { get; init; }
     public required Dictionary<(int Fx, int Fz), float> Water { get; init; }
 
-    // Kept for future presets that do want an ongoing spring (e.g. a
-    // river); the current lake preset always leaves this false — it's
-    // filled once at generation time, not continuously topped up.
-    public bool HasWaterSource { get; init; }
-    public int SourceFx { get; init; }
-    public int SourceFz { get; init; }
+    // Permanent water sources, by coarse tile. The map starts with one on
+    // high ground so there's a river running somewhere from the first
+    // frame — water that's already moving is the clearest possible
+    // demonstration that terrain can be dug to redirect it.
+    public required List<(int X, int Z)> Springs { get; init; }
   }
 
   public static Result GenerateRollingHillsWithLake(
-    int width, int depth, int fineSubdivisions, int maxHeightVoxels, int seed)
+    int width, int depth, int fineSubdivisions, int maxHeightVoxels, int seed, bool generateSpring = false)
   {
     int fineWidth = width * fineSubdivisions;
     int fineDepth = depth * fineSubdivisions;
@@ -37,9 +36,20 @@ public static class WorldGenerator
 
     var water = CarveLake(height, top, fineWidth, fineDepth, fineSubdivisions, rng);
 
+    // var springs = new List<(int X, int Z)> { HighestTile(height, width, depth, fineSubdivisions) };
+    var springs = new List<(int X, int Z)>();
+    if (generateSpring)
+      springs.Add(HighestTile(height, width, depth, fineSubdivisions));
+
     var trees = ScatterTrees(width, depth, fineSubdivisions, top, rng);
     var treeTiles = trees.Select(t => (t.TileX, t.TileZ)).ToHashSet();
     var bushes = ScatterBushes(width, depth, fineSubdivisions, top, treeTiles, rng);
+
+    // A spring on a tile a tree or bush also landed on would be hidden
+    // under it, so those lose — the spring was placed first and is the
+    // more important of the two.
+    trees.RemoveAll(t => springs.Contains((t.TileX, t.TileZ)));
+    bushes.RemoveAll(b => springs.Contains((b.TileX, b.TileZ)));
 
     return new Result
     {
@@ -48,8 +58,44 @@ public static class WorldGenerator
       Trees = trees,
       Bushes = bushes,
       Water = water,
-      HasWaterSource = false,
+      Springs = springs,
     };
+  }
+
+  // How far in from the rim the starting spring has to sit, as a fraction
+  // of the map. The highest ground on a noise heightmap is as likely as
+  // not to be in a corner, and a spring there just pours over the edge and
+  // vanishes — the map drains at its boundary. Holding it inland gives its
+  // water somewhere to actually run.
+  const float SpringInlandMargin = 0.25f;
+
+  // The highest coarse tile in the inland part of the map, sampled at each
+  // tile's centre fine column the same way TileMap does. Putting the
+  // starting spring on high ground gives its water the longest run
+  // downhill, so the river it forms crosses a good part of the map rather
+  // than pooling where it lands.
+  static (int X, int Z) HighestTile(int[,] height, int width, int depth, int fineSubdivisions)
+  {
+    int marginX = (int)(width * SpringInlandMargin);
+    int marginZ = (int)(depth * SpringInlandMargin);
+
+    (int X, int Z) best = (width / 2, depth / 2);
+    int bestHeight = -1;
+
+    for (int x = marginX; x < width - marginX; x++)
+    {
+      for (int z = marginZ; z < depth - marginZ; z++)
+      {
+        int fx = x * fineSubdivisions + fineSubdivisions / 2;
+        int fz = z * fineSubdivisions + fineSubdivisions / 2;
+        if (height[fx, fz] <= bestHeight) continue;
+
+        bestHeight = height[fx, fz];
+        best = (x, z);
+      }
+    }
+
+    return best;
   }
 
   // Rolling hills via a few octaves of value noise, sampled directly on the
