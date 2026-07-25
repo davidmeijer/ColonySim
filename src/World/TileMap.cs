@@ -156,7 +156,15 @@ public class TileMap
   // entirely, so the shader's texColor * vertexColor multiply is always
   // valid and just no-ops back to the plain lit vertex colour when no art
   // has been supplied yet.
-  static readonly string[] MaterialTextureFile = { "grass.png", "dirt.png", "rock.png" };
+  static readonly string[] MaterialBaseName = { "grass", "dirt", "rock" };
+  static readonly string[] TextureExtensions = { ".png", ".jpg", ".jpeg" };
+
+  // A tile texture repeats every TextureWorldSize world units on screen —
+  // it never benefits from being bigger than this, so a source photo
+  // straight off a phone (multi-thousand-pixel, a couple MB) gets scaled
+  // down to it on load rather than eating that much GPU memory verbatim.
+  const int MaxTextureDimension = 256;
+
   readonly Texture2D[] _materialTextures = new Texture2D[MaterialSlotCount];
 
   // Water gets the same treatment on its own set of chunks, tracked
@@ -226,30 +234,67 @@ public class TileMap
     }
   }
 
-  // Looks for Assets/Textures/{grass,dirt,rock}.png next to the built
-  // executable — see Assets/Textures/README.md for exactly what to drop in
-  // there. Whatever's missing just gets a 1x1 white pixel instead, which
-  // is what keeps a material's appearance identical to today's flat colour
-  // until real art shows up for it.
+  // Looks for Assets/Textures/{grass,dirt,rock}.{png,jpg,jpeg} next to the
+  // built executable — see Assets/Textures/README.md for exactly what to
+  // drop in there. Whatever's missing just gets a 1x1 white pixel instead,
+  // which is what keeps a material's appearance identical to today's flat
+  // colour until real art shows up for it.
+  static Texture2D BlankAlbedo()
+  {
+    Image blank = Raylib.GenImageColor(1, 1, Color.White);
+    var tex = Raylib.LoadTextureFromImage(blank);
+    Raylib.UnloadImage(blank);
+    return tex;
+  }
+
   void LoadMaterialTextures()
   {
     string dir = Path.Combine(AppContext.BaseDirectory, "Assets", "Textures");
     for (int slot = 0; slot < MaterialSlotCount; slot++)
     {
-      string path = Path.Combine(dir, MaterialTextureFile[slot]);
-      if (File.Exists(path))
+      string? path = null;
+      foreach (var ext in TextureExtensions)
       {
-        var tex = Raylib.LoadTexture(path);
-        Raylib.SetTextureWrap(tex, TextureWrap.Repeat);
-        Raylib.SetTextureFilter(tex, TextureFilter.Bilinear);
-        _materialTextures[slot] = tex;
+        string candidate = Path.Combine(dir, MaterialBaseName[slot] + ext);
+        if (File.Exists(candidate)) { path = candidate; break; }
       }
-      else
+
+      if (path == null)
       {
-        Image blank = Raylib.GenImageColor(1, 1, Color.White);
-        _materialTextures[slot] = Raylib.LoadTextureFromImage(blank);
-        Raylib.UnloadImage(blank);
+        _materialTextures[slot] = BlankAlbedo();
+        continue;
       }
+
+      Image img = Raylib.LoadImage(path);
+
+      // A found-but-undecodable file (wrong format despite the extension,
+      // corrupt data, a format stb_image doesn't support — e.g. this
+      // build's raylib has no real JPG decoder even though it'll read a
+      // .jpg's bytes) mustn't turn into an invalid, all-black texture: an
+      // Image that failed to decode still gets bound to the material, and
+      // an incomplete GL texture samples as solid black rather than
+      // falling back cleanly. Catch it here instead and fall back to the
+      // same blank pixel a missing file gets.
+      if (!Raylib.IsImageValid(img))
+      {
+        Console.Error.WriteLine(
+          $"[TileMap] Couldn't decode texture '{path}' — falling back to the plain colour for this material. " +
+          "(Raylib's PNG loader can't read non-PNG bytes even if the extension says .png — this build also has no real JPG decoder at all.)");
+        _materialTextures[slot] = BlankAlbedo();
+        continue;
+      }
+
+      if (img.Width > MaxTextureDimension || img.Height > MaxTextureDimension)
+      {
+        float scale = MaxTextureDimension / (float)Math.Max(img.Width, img.Height);
+        Raylib.ImageResize(ref img, Math.Max(1, (int)(img.Width * scale)), Math.Max(1, (int)(img.Height * scale)));
+      }
+
+      var tex = Raylib.LoadTextureFromImage(img);
+      Raylib.UnloadImage(img);
+      Raylib.SetTextureWrap(tex, TextureWrap.Repeat);
+      Raylib.SetTextureFilter(tex, TextureFilter.Bilinear);
+      _materialTextures[slot] = tex;
     }
   }
 
