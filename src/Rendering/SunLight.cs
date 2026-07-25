@@ -40,7 +40,8 @@ public class SunLight
     """;
 
   // shadowMapTexel is baked in as a literal (rather than a uniform) since
-  // the shadow map's resolution never changes at runtime.
+  // the shadow map's resolution never changes at runtime. MAX_POINT_LIGHTS
+  // mirrors SunLight.MaxPointLights — see SetPointLights.
   static string FragmentSrc(int shadowMapSize) => $$"""
     #version 330
     in vec3 fragPosition;
@@ -52,6 +53,12 @@ public class SunLight
     uniform vec3 ambientColor;
     uniform mat4 lightVP;
     uniform sampler2D shadowMap;
+
+    #define MAX_POINT_LIGHTS 8
+    #define POINT_LIGHT_RADIUS 220.0
+    uniform vec3 pointLightPos[MAX_POINT_LIGHTS];
+    uniform vec3 pointLightColor[MAX_POINT_LIGHTS];
+    uniform int pointLightCount;
 
     out vec4 finalColor;
 
@@ -98,6 +105,21 @@ public class SunLight
         float shadow = ndotl > 0.0 ? ShadowFactor(fragPosition, ndotl) : 1.0;
 
         vec3 lit = fragColor.rgb * (ambientColor + lightColor * ndotl * shadow);
+
+        // Local glow sources (campfires) — additive, unshadowed (a full
+        // shadow map per point light would be a lot of machinery for a
+        // small cosmetic glow), falling off smoothly to zero at
+        // POINT_LIGHT_RADIUS so a fire lights its immediate surroundings
+        // without needing per-light attenuation tuning from the C# side.
+        for (int i = 0; i < pointLightCount; i++)
+        {
+            vec3 toLight = pointLightPos[i] - fragPosition;
+            float dist = length(toLight);
+            float pndotl = max(dot(n, toLight / max(dist, 0.0001)), 0.0);
+            float atten = clamp(1.0 - dist / POINT_LIGHT_RADIUS, 0.0, 1.0);
+            lit += fragColor.rgb * pointLightColor[i] * pndotl * (atten * atten);
+        }
+
         finalColor = vec4(lit, fragColor.a);
     }
     """;
@@ -120,8 +142,15 @@ public class SunLight
   // specific slot possible.
   const int ShadowMapTextureSlot = 15;
 
+  // Has to match FragmentSrc's MAX_POINT_LIGHTS exactly — extra lights
+  // beyond this are silently dropped by SetPointLights.
+  public const int MaxPointLights = 8;
+
   readonly Shader _shader;
   readonly int _lightDirLoc, _lightColorLoc, _ambientColorLoc, _lightVPLoc, _shadowMapLoc;
+  readonly int _pointLightPosLoc, _pointLightColorLoc, _pointLightCountLoc;
+  readonly Vector3[] _pointLightPosBuffer = new Vector3[MaxPointLights];
+  readonly Vector3[] _pointLightColorBuffer = new Vector3[MaxPointLights];
 
   readonly uint _shadowFboId;
   readonly Texture2D _shadowDepthTexture;
@@ -213,6 +242,9 @@ public class SunLight
     _ambientColorLoc = Raylib.GetShaderLocation(_shader, "ambientColor");
     _lightVPLoc = Raylib.GetShaderLocation(_shader, "lightVP");
     _shadowMapLoc = Raylib.GetShaderLocation(_shader, "shadowMap");
+    _pointLightPosLoc = Raylib.GetShaderLocation(_shader, "pointLightPos");
+    _pointLightColorLoc = Raylib.GetShaderLocation(_shader, "pointLightColor");
+    _pointLightCountLoc = Raylib.GetShaderLocation(_shader, "pointLightCount");
 
     (_shadowFboId, _shadowDepthTexture) = LoadShadowMap(ShadowMapSize);
     _shadowTarget = new RenderTexture2D
@@ -364,6 +396,7 @@ public class SunLight
     map.DrawSolid();
     map.DrawTrees();
     map.DrawBushes();
+    map.DrawCampfiresLit();
     foreach (var actor in actors) actor.DrawShadowCaster();
     Raylib.EndShaderMode();
     Raylib.EndMode3D();
@@ -373,6 +406,26 @@ public class SunLight
 
     Raylib.SetShaderValueMatrix(_shader, _lightVPLoc, lightViewProj);
     BindShadowMapSampler();
+  }
+
+  // Uploads up to MaxPointLights local glow sources (currently just
+  // campfires — see TileMap.CampfireLights) on top of the one directional
+  // sun/moon light above. Extra lights past the cap are silently dropped.
+  // Call once per frame before the lit pass; harmless to call with zero
+  // lights (pointLightCount just stays/becomes 0 and the shader's loop
+  // over it doesn't run).
+  public void SetPointLights(IReadOnlyList<Vector3> positions, IReadOnlyList<Vector3> colors)
+  {
+    int count = Math.Min(positions.Count, MaxPointLights);
+    for (int i = 0; i < count; i++)
+    {
+      _pointLightPosBuffer[i] = positions[i];
+      _pointLightColorBuffer[i] = colors[i];
+    }
+
+    Raylib.SetShaderValueV(_shader, _pointLightPosLoc, _pointLightPosBuffer, ShaderUniformDataType.Vec3, count);
+    Raylib.SetShaderValueV(_shader, _pointLightColorLoc, _pointLightColorBuffer, ShaderUniformDataType.Vec3, count);
+    Raylib.SetShaderValue(_shader, _pointLightCountLoc, count, ShaderUniformDataType.Int);
   }
 
   // Wrap the lit draw calls (terrain fill, water, actors) between these.

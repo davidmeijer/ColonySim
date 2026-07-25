@@ -114,6 +114,17 @@ public class TileMap
   readonly List<Bush> _bushes = new();
   readonly HashSet<(int X, int Z)> _bushTiles = new();
 
+  // Campfires, placed by the player through the build menu (see
+  // Program.cs). Blocks pathfinding on its own tile — you can't stand in
+  // the fire — the same way a tree or bush tile does.
+  readonly List<Campfire> _campfires = new();
+  readonly HashSet<(int X, int Z)> _campfireTiles = new();
+
+  // Shared clock for flame-flicker animation (both the visible flame and
+  // its point light read off this), and for how often scorched ground gets
+  // refreshed — see UpdateVegetation.
+  float _campfireTime;
+
   // Rendering: one Model per chunk of the fine grid. Tracked per chunk
   // (not one global flag) and rebuilt only where something actually
   // changed — water alone can dirty a chunk every tick while a stream is
@@ -198,11 +209,22 @@ public class TileMap
   // either way.
   public void UpdateVegetation(float dt)
   {
+    _campfireTime += dt;
+
     _regrowthTimer += dt;
     while (_regrowthTimer >= RegrowthTickInterval)
     {
       _regrowthTimer -= RegrowthTickInterval;
       StepRegrowth(RegrowthTickInterval);
+
+      // A campfire keeps its clearing scorched for as long as it burns —
+      // without this, ordinary regrowth would eventually grass back over
+      // ground right next to a fire that's still lit.
+      foreach (var fire in _campfires)
+      {
+        var (fx, fz) = FineCenter(fire.TileX, fire.TileZ);
+        ScorchAround(fx, fz, ScorchRadiusVoxels);
+      }
     }
   }
 
@@ -404,6 +426,89 @@ public class TileMap
     return needed;
   }
 
+  // --- Campfires ---
+
+  public IReadOnlyList<Campfire> Campfires => _campfires;
+
+  // How far (in fine voxels) a campfire's heat scorches Grass to Dirt
+  // around it — see ScorchAround.
+  const float ScorchRadiusVoxels = 16f;
+
+  // A spot has to be ordinary open ground: walkable, dry, and not already
+  // occupied by another campfire.
+  public bool CanPlaceCampfire(int x, int z) =>
+    IsWalkable(x, z) && WaterDepth(x, z) <= 0f && !_campfireTiles.Contains((x, z));
+
+  // Places a lit campfire on a coarse tile, immediately scorching the grass
+  // around it (see ScorchAround) and blocking that tile from pathfinding —
+  // an actor can't stand in the fire, the same way it can't stand in a
+  // tree. Returns null without changing anything if the spot isn't valid;
+  // callers should check CanPlaceCampfire first if they want to know why.
+  public Campfire? PlaceCampfire(int x, int z)
+  {
+    if (!CanPlaceCampfire(x, z)) return null;
+
+    var fire = new Campfire(x, z, Random.Shared.NextSingle() * MathF.Tau);
+    _campfires.Add(fire);
+    _campfireTiles.Add((x, z));
+
+    var (fx, fz) = FineCenter(x, z);
+    ScorchAround(fx, fz, ScorchRadiusVoxels);
+    return fire;
+  }
+
+  // Turns every Grass column within radiusVoxels of (centerFx, centerFz)
+  // to Dirt — scorched earth, the same "wash the grass to mud" move
+  // StepWater's shoreline effect makes, just centred on a fire instead of
+  // water. Already-Dirt/Rock columns are left alone, and this is safe to
+  // call repeatedly on the same spot (re-applied periodically in
+  // UpdateVegetation so regrowth can't creep back in under a burning fire).
+  void ScorchAround(int centerFx, int centerFz, float radiusVoxels)
+  {
+    int r = (int)MathF.Ceiling(radiusVoxels);
+    for (int dx = -r; dx <= r; dx++)
+    {
+      for (int dz = -r; dz <= r; dz++)
+      {
+        if (dx * dx + dz * dz > radiusVoxels * radiusVoxels) continue;
+        int fx = centerFx + dx, fz = centerFz + dz;
+        if (fx < 0 || fz < 0 || fx >= FineWidth || fz >= FineDepth) continue;
+        if (_voxelTop[fx, fz] != TileType.Grass) continue;
+
+        _voxelTop[fx, fz] = TileType.Dirt;
+        MarkChunkDirtyAt(fx, fz);
+      }
+    }
+  }
+
+  // 0..1-ish flicker driven off the shared campfire clock, phase-offset per
+  // fire so a cluster of them doesn't pulse in lockstep. Shared by the
+  // point light colour (CampfireLights) and the visible flame's scale
+  // (DrawCampfiresGlow) so the glow and the flame that's supposedly casting
+  // it always move together.
+  float Flicker(float phase) =>
+    1f + 0.15f * MathF.Sin(_campfireTime * 8f + phase) + 0.08f * MathF.Sin(_campfireTime * 19f + phase * 2.3f);
+
+  // A point light per campfire, positioned roughly at flame height — for
+  // SunLight.SetPointLights to upload to the lighting shader each frame.
+  // No shadow-casting for these (a full shadow map per campfire would be a
+  // lot of machinery for a small cosmetic glow); at night, against the
+  // sun's near-zero ambient, the glow alone reads clearly.
+  static readonly Vector3 CampfireLightColor = new(1.6f, 0.85f, 0.35f);
+  const float CampfireLightHeight = TileSize * 0.6f;
+
+  public IEnumerable<(Vector3 Position, Vector3 Color)> CampfireLights()
+  {
+    foreach (var fire in _campfires)
+    {
+      float worldX = fire.TileX * TileSize + TileSize / 2f;
+      float worldZ = fire.TileZ * TileSize + TileSize / 2f;
+      float baseY = SmoothSurfaceY(worldX, worldZ);
+      Vector3 pos = new(worldX, baseY + CampfireLightHeight, worldZ);
+      yield return (pos, CampfireLightColor * Flicker(fire.FlickerPhase));
+    }
+  }
+
   // Whether an actor standing at (fromX, fromZ) can take one step onto the
   // adjacent tile (toX, toZ): the destination has to be walkable on its
   // own terms, and the climb can't be steeper than half an old block.
@@ -471,7 +576,8 @@ public class TileMap
   }
 
   // Bare rock faces block movement, so does water too deep to wade, and so
-  // does a tree or a bush — you can't walk through a trunk, or a shrub.
+  // does a tree, a bush, or a lit campfire — you can't walk through a
+  // trunk, a shrub, or a fire.
   public bool IsWalkable(int x, int z)
   {
     if (!InBounds(x, z)) return false;
@@ -479,6 +585,7 @@ public class TileMap
     if (WaterDepth(x, z) > MaxWadeableWaterVoxels) return false;
     if (_treeTiles.Contains((x, z))) return false;
     if (_bushTiles.Contains((x, z))) return false;
+    if (_campfireTiles.Contains((x, z))) return false;
     return true;
   }
 
@@ -864,6 +971,77 @@ public class TileMap
         Vector3 center = new(worldX, baseY + (i + 0.5f) * BushLayerHeight, worldZ);
         Raylib.DrawCube(center, width, BushLayerHeight, width, color);
       }
+    }
+  }
+
+  // The wood + stone ring: ordinary lit geometry, shaded and shadowed like
+  // anything else, so call this inside BeginLit/EndLit (and include it in
+  // the shadow pass) same as trees/bushes. The flame itself is drawn
+  // separately by DrawCampfiresGlow, unlit — it's the light source, not
+  // something the light should be shading.
+  const float LogLength = TileSize * 0.85f;
+  const float LogThickness = TileSize * 0.16f;
+  const int StoneCount = 8;
+  const float StoneRingRadius = TileSize * 0.42f;
+  static readonly Color LogColor = new(92, 58, 34, 255);
+  static readonly Color[] StoneColors = { new(120, 120, 118, 255), new(102, 102, 100, 255), new(134, 132, 128, 255) };
+
+  public void DrawCampfiresLit()
+  {
+    foreach (var fire in _campfires)
+    {
+      float worldX = fire.TileX * TileSize + TileSize / 2f;
+      float worldZ = fire.TileZ * TileSize + TileSize / 2f;
+      float baseY = SmoothSurfaceY(worldX, worldZ);
+
+      Vector3 logCenter = new(worldX, baseY + LogThickness / 2f, worldZ);
+      Raylib.DrawCube(logCenter, LogLength, LogThickness, LogThickness * 0.9f, LogColor);
+      Raylib.DrawCube(logCenter, LogThickness * 0.9f, LogThickness, LogLength, LogColor);
+
+      for (int i = 0; i < StoneCount; i++)
+      {
+        float a = i / (float)StoneCount * MathF.Tau;
+        Vector3 stonePos = new(
+          worldX + MathF.Cos(a) * StoneRingRadius, baseY + TileSize * 0.06f, worldZ + MathF.Sin(a) * StoneRingRadius);
+        Raylib.DrawCube(stonePos, TileSize * 0.14f, TileSize * 0.12f, TileSize * 0.14f, StoneColors[i % StoneColors.Length]);
+      }
+    }
+  }
+
+  // The flame itself: drawn unlit, like SunLight's sun/moon spheres, so it
+  // stays vividly visible regardless of ambient darkness — it IS the light,
+  // not something lit by it. The actual "lights up its surroundings" effect
+  // comes from the real point light in CampfireLights, not from anything
+  // drawn here; an earlier version of this also drew a big translucent
+  // "glow" sphere around the flame for a soft-bloom look, but with
+  // backface culling off a flat-alpha sphere shows both its near and far
+  // surface at once, which reads as a hard-edged solid blob rather than a
+  // glow — not worth it for a purely decorative touch, so it's gone.
+  // Scale/height flicker off the same clock (see Flicker) that drives the
+  // point light's colour, so the visible flame and the light it's
+  // supposedly casting move in lockstep.
+  static readonly Color FlameColorBase = new(255, 140, 40, 235);
+  static readonly Color FlameColorTip = new(255, 220, 90, 210);
+
+  public void DrawCampfiresGlow()
+  {
+    foreach (var fire in _campfires)
+    {
+      float worldX = fire.TileX * TileSize + TileSize / 2f;
+      float worldZ = fire.TileZ * TileSize + TileSize / 2f;
+      float baseY = SmoothSurfaceY(worldX, worldZ);
+      float flicker = Flicker(fire.FlickerPhase);
+
+      // DrawCylinder's position is the base (near) end, with radiusBottom
+      // there and radiusTop at the far end — so the tapering-to-a-point
+      // shape of a flame needs the SMALL radius as radiusTop, not radiusBottom.
+      Vector3 basePos = new(worldX, baseY + LogThickness, worldZ);
+      float h1 = TileSize * 0.55f * flicker;
+      Raylib.DrawCylinder(basePos, TileSize * 0.02f, TileSize * 0.16f, h1, 8, FlameColorBase);
+
+      Vector3 tipPos = new(worldX, basePos.Y + h1 * 0.35f, worldZ);
+      float h2 = TileSize * 0.35f * flicker;
+      Raylib.DrawCylinder(tipPos, TileSize * 0.01f, TileSize * 0.10f, h2, 8, FlameColorTip);
     }
   }
 

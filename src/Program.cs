@@ -71,6 +71,30 @@ public static class Program
         public bool DraggingSpeed;
     }
 
+    // Top-left build icon (kept well clear of the "Selected: x/y" text next
+    // to it, and of the settings gear in the opposite corner) that opens a
+    // small palette of placeable items. Picking an item arms Placing —
+    // the next left-click on a valid tile drops it there.
+    static readonly Rectangle BuildButtonRect = new(150, 10, 36, 36);
+
+    const float BuildPanelWidth = 150f;
+    const float BuildPanelX = 150f;
+    const float BuildPanelY = 56f;
+    static readonly Rectangle BuildPanelRect = new(BuildPanelX, BuildPanelY, BuildPanelWidth, 54f);
+    static readonly Rectangle CampfireItemRect = new(BuildPanelX + 8, BuildPanelY + 8, BuildPanelWidth - 16, 38);
+
+    class BuildMenuState
+    {
+        public bool Open;
+        public bool Placing; // an item is armed; the next tile click places it
+
+        // Tracked separately from SelectionState's identical right-click
+        // fields so a right-drag to orbit the camera while lining up a
+        // placement doesn't get mistaken for the cancel gesture below.
+        public Vector2? RightDownPos;
+        public bool RightDragged;
+    }
+
     public static void Main()
     {
         // Create the OS window and cap the loop at 60 frames per second.
@@ -87,6 +111,7 @@ public static class Program
 
         var selection = new SelectionState();
         var settingsMenu = new SettingsMenuState();
+        var buildMenu = new BuildMenuState();
         bool showGrid = true;
 
         // A slowly-drifting directional light, so faces catch shading
@@ -121,11 +146,11 @@ public static class Program
             // movement by dt makes speeds frame-rate independent.
             float dt = Raylib.GetFrameTime();
 
-            Update(dt, map, actors, selection, settingsMenu, sun, ref camera, ref camTarget, ref camYaw, ref camPitch, ref camDistance, ref showGrid);
+            Update(dt, map, actors, selection, settingsMenu, buildMenu, sun, ref camera, ref camTarget, ref camYaw, ref camPitch, ref camDistance, ref showGrid);
             map.UpdateWater(dt);
             map.UpdateVegetation(dt);
             sun.Update(dt);
-            Draw(map, actors, selection, settingsMenu, camera, sun, showGrid);
+            Draw(map, actors, selection, settingsMenu, buildMenu, camera, sun, showGrid);
         }
 
         sun.Unload();
@@ -134,7 +159,8 @@ public static class Program
     }
 
     static void Update(float dt, TileMap map, List<Actor> actors, SelectionState selection, SettingsMenuState settingsMenu,
-        SunLight sun, ref Camera3D camera, ref Vector3 camTarget, ref float yaw, ref float pitch, ref float distance, ref bool showGrid)
+        BuildMenuState buildMenu, SunLight sun, ref Camera3D camera, ref Vector3 camTarget, ref float yaw, ref float pitch,
+        ref float distance, ref bool showGrid)
     {
         // --- Zoom with the mouse wheel, clamped to a sane range ---
         float wheel = Raylib.GetMouseWheelMove();
@@ -181,18 +207,26 @@ public static class Program
 
         bool shiftHeld = Raylib.IsKeyDown(KeyboardKey.LeftShift) || Raylib.IsKeyDown(KeyboardKey.RightShift);
 
+        // The build menu is checked first: while an item is armed
+        // (Placing), it swallows every click itself, so the settings panel
+        // and action menu are skipped entirely for that frame — otherwise a
+        // placement click that happens to land over one of their buttons
+        // (bottom-left action menu, top-right settings) would fire that
+        // button instead of placing anything.
+        bool buildConsumedClick = UpdateBuildMenu(map, buildMenu, camera);
+
         // The settings panel lives outside the selection-driven action menu
         // (it has to work with nothing selected), but its clicks still need
         // consuming for the same reason: otherwise they'd also register as
         // world clicks and stomp the selection.
-        bool settingsConsumedClick = UpdateSettingsMenu(sun, settingsMenu, ref showGrid);
+        bool settingsConsumedClick = !buildMenu.Placing && UpdateSettingsMenu(sun, settingsMenu, ref showGrid);
 
         // Action-menu clicks are handled first and, if one lands, consumed —
         // otherwise clicking "Jump" would also register as a world click and
         // immediately clear the very selection you just acted on.
-        bool menuConsumedClick = UpdateActionMenu(map, selection);
-        UpdateSelection(actors, selection, camera, shiftHeld, menuConsumedClick || settingsConsumedClick);
-        UpdateMoveOrders(map, actors, selection, camera);
+        bool menuConsumedClick = !buildMenu.Placing && UpdateActionMenu(map, selection);
+        UpdateSelection(actors, selection, camera, shiftHeld, menuConsumedClick || settingsConsumedClick || buildConsumedClick);
+        if (!buildMenu.Placing) UpdateMoveOrders(map, actors, selection, camera);
 
         // Everyone seeks their own next waypoint independently — no per-tile
         // locking — then overlaps get shoved apart, then anyone who's made
@@ -471,46 +505,136 @@ public static class Program
 
         if (Raylib.IsMouseButtonReleased(MouseButton.Right))
         {
-            if (!selection.RightDragged && selection.Selected.Count > 0)
+            if (!selection.RightDragged && selection.Selected.Count > 0 &&
+                TryPickTile(map, camera, Raylib.GetMousePosition(), out int hitX, out int hitZ) &&
+                map.IsWalkable(hitX, hitZ))
             {
-                Ray ray = Raylib.GetScreenToWorldRay(Raylib.GetMousePosition(), camera);
-
-                int hitX = -1, hitZ = -1;
-                float bestDist = float.MaxValue;
-                for (int x = 0; x < map.Width; x++)
+                // A direct order always overrides whatever an actor was
+                // doing before, including a give-up — SetPath (not
+                // Reroute) resets its stuck budget for the new attempt.
+                var movers = selection.Selected.ToList();
+                var blockingTiles = BlockingTiles(actors);
+                var destinations = AssignDestinations(map, movers, hitX, hitZ, blockingTiles);
+                foreach (var (actor, dest) in destinations)
                 {
-                    for (int z = 0; z < map.Depth; z++)
-                    {
-                        var hit = Raylib.GetRayCollisionBox(ray, map.ColumnBounds(x, z));
-                        if (hit.Hit && hit.Distance < bestDist)
-                        {
-                            bestDist = hit.Distance;
-                            hitX = x;
-                            hitZ = z;
-                        }
-                    }
-                }
-
-                if (hitX >= 0 && map.IsWalkable(hitX, hitZ))
-                {
-                    // A direct order always overrides whatever an actor was
-                    // doing before, including a give-up — SetPath (not
-                    // Reroute) resets its stuck budget for the new attempt.
-                    var movers = selection.Selected.ToList();
-                    var blockingTiles = BlockingTiles(actors);
-                    var destinations = AssignDestinations(map, movers, hitX, hitZ, blockingTiles);
-                    foreach (var (actor, dest) in destinations)
-                    {
-                        var path = AStar.FindPath(map, actor.TileX, actor.TileZ, dest.X, dest.Z,
-                            PathBlocker(blockingTiles, actor));
-                        actor.SetPath(path);
-                    }
+                    var path = AStar.FindPath(map, actor.TileX, actor.TileZ, dest.X, dest.Z,
+                        PathBlocker(blockingTiles, actor));
+                    actor.SetPath(path);
                 }
             }
 
             selection.RightDownPos = null;
             selection.RightDragged = false;
         }
+    }
+
+    // Ray-casts from a screen position through every coarse tile's column
+    // bounds and returns the nearest one hit — the shared "what tile is the
+    // mouse over" query used by move orders and campfire placement alike.
+    static bool TryPickTile(TileMap map, Camera3D camera, Vector2 screenPos, out int tileX, out int tileZ)
+    {
+        Ray ray = Raylib.GetScreenToWorldRay(screenPos, camera);
+
+        int hitX = -1, hitZ = -1;
+        float bestDist = float.MaxValue;
+        for (int x = 0; x < map.Width; x++)
+        {
+            for (int z = 0; z < map.Depth; z++)
+            {
+                var hit = Raylib.GetRayCollisionBox(ray, map.ColumnBounds(x, z));
+                if (hit.Hit && hit.Distance < bestDist)
+                {
+                    bestDist = hit.Distance;
+                    hitX = x;
+                    hitZ = z;
+                }
+            }
+        }
+
+        tileX = hitX;
+        tileZ = hitZ;
+        return hitX >= 0;
+    }
+
+    // The build icon toggles the palette; picking "Campfire" arms Placing,
+    // and the very next left-click (wherever it lands, on a valid tile or
+    // not) either places the fire or is simply swallowed — see the
+    // Placing-gated calls in Update() for why every other click handler
+    // steps aside while this is true. Right-click or Escape cancels
+    // placement without closing anything else.
+    static bool UpdateBuildMenu(TileMap map, BuildMenuState menu, Camera3D camera)
+    {
+        Vector2 mouse = Raylib.GetMousePosition();
+        bool leftPressed = Raylib.IsMouseButtonPressed(MouseButton.Left);
+
+        if (leftPressed && Raylib.CheckCollisionPointRec(mouse, BuildButtonRect))
+        {
+            menu.Open = !menu.Open;
+            if (!menu.Open) menu.Placing = false;
+            return true;
+        }
+
+        if (menu.Placing)
+        {
+            if (Raylib.IsKeyPressed(KeyboardKey.Escape))
+            {
+                menu.Placing = false;
+                return true;
+            }
+
+            // A genuine right-click (press+release without dragging past
+            // the threshold) cancels; a right-drag is left alone so it
+            // still orbits the camera, same distinction UpdateMoveOrders
+            // makes for its own right-click.
+            if (Raylib.IsMouseButtonPressed(MouseButton.Right))
+            {
+                menu.RightDownPos = mouse;
+                menu.RightDragged = false;
+            }
+            if (Raylib.IsMouseButtonDown(MouseButton.Right) && menu.RightDownPos is { } rightDown)
+            {
+                if (Vector2.Distance(rightDown, mouse) > DragThreshold) menu.RightDragged = true;
+            }
+            if (Raylib.IsMouseButtonReleased(MouseButton.Right))
+            {
+                bool wasDrag = menu.RightDragged;
+                menu.RightDownPos = null;
+                menu.RightDragged = false;
+                if (!wasDrag)
+                {
+                    menu.Placing = false;
+                    return true;
+                }
+            }
+
+            if (leftPressed)
+            {
+                if (TryPickTile(map, camera, mouse, out int tx, out int tz) && map.CanPlaceCampfire(tx, tz))
+                    map.PlaceCampfire(tx, tz);
+                menu.Placing = false;
+                return true;
+            }
+
+            return true; // swallow every click (and non-click) frame while armed
+        }
+
+        if (!menu.Open) return false;
+
+        if (leftPressed)
+        {
+            if (Raylib.CheckCollisionPointRec(mouse, CampfireItemRect))
+            {
+                menu.Placing = true;
+                menu.Open = false;
+                return true;
+            }
+
+            if (Raylib.CheckCollisionPointRec(mouse, BuildPanelRect)) return true;
+
+            menu.Open = false; // click outside closes it, same as the settings panel
+        }
+
+        return false;
     }
 
     // Tiles that should be routed around like solid rock: actors standing
@@ -577,8 +701,22 @@ public static class Program
         return null; // no free tile anywhere — shouldn't happen in practice
     }
 
-    static void Draw(TileMap map, List<Actor> actors, SelectionState selection, SettingsMenuState settingsMenu, Camera3D camera, SunLight sun, bool showGrid)
+    static void Draw(TileMap map, List<Actor> actors, SelectionState selection, SettingsMenuState settingsMenu,
+        BuildMenuState buildMenu, Camera3D camera, SunLight sun, bool showGrid)
     {
+        // Every campfire's point light, refreshed each frame (flicker means
+        // even a stationary fire's colour keeps changing) — has to happen
+        // before the lit pass below reads these uniforms, and before the
+        // shadow pass too for tidiness even though shadows don't use them.
+        var pointLightPositions = new List<Vector3>();
+        var pointLightColors = new List<Vector3>();
+        foreach (var (pos, color) in map.CampfireLights())
+        {
+            pointLightPositions.Add(pos);
+            pointLightColors.Add(color);
+        }
+        sun.SetPointLights(pointLightPositions, pointLightColors);
+
         // Rendered from the light's point of view into its own depth
         // texture before anything else — the main lit pass right below
         // needs that result (via the shader's shadowMap uniform) already
@@ -594,12 +732,17 @@ public static class Program
 
         sun.DrawCelestialBodies(new Vector3(map.WidthPx / 2f, 100f, map.DepthPx / 2f));
 
+        // Campfire flames are unlit for the same reason the sun/moon are —
+        // they're the light source, not something the light should shade.
+        map.DrawCampfiresGlow();
+
         // Lit pass: shading depends on which way each face points, so the
         // sun alone gives hills a sense of depth.
         sun.BeginLit();
         map.DrawSolid();
         map.DrawTrees();
         map.DrawBushes();
+        map.DrawCampfiresLit();
         map.DrawWater();
         foreach (var actor in actors) actor.DrawSolid();
         sun.EndLit();
@@ -610,6 +753,20 @@ public static class Program
         // toggled from the settings panel — everything else here isn't.
         if (showGrid) map.DrawOutlines();
         foreach (var actor in actors) actor.DrawOutline();
+
+        // A ghost ring on whichever tile the mouse is over while an item is
+        // armed: green if it's a legal spot, red if not (water, a tree, an
+        // existing fire, ...), so the player knows before clicking.
+        if (buildMenu.Placing && TryPickTile(map, camera, Raylib.GetMousePosition(), out int hoverX, out int hoverZ))
+        {
+            bool valid = map.CanPlaceCampfire(hoverX, hoverZ);
+            Color ringColor = valid ? new Color(255, 170, 60, 220) : new Color(220, 60, 60, 220);
+            Vector3 ringCenter = new(
+                hoverX * TileMap.TileSize + TileMap.TileSize / 2f,
+                map.SurfaceY(hoverX, hoverZ) + 2f,
+                hoverZ * TileMap.TileSize + TileMap.TileSize / 2f);
+            Raylib.DrawCircle3D(ringCenter, TileMap.TileSize * 0.45f, new Vector3(1f, 0f, 0f), 90f, ringColor);
+        }
 
         Raylib.EndMode3D();
 
@@ -628,6 +785,7 @@ public static class Program
         Raylib.DrawText($"Selected: {selection.Selected.Count}/{actors.Count}", 10, 10, 18, Color.Black);
 
         DrawSettingsMenu(sun, settingsMenu, showGrid);
+        DrawBuildMenu(buildMenu);
 
         // The action menu, only while something's selected.
         if (selection.Selected.Count > 0)
@@ -687,6 +845,27 @@ public static class Program
 
         DrawSlider(TimeSliderTrack, $"Time of day: {FormatTimeOfDay(sun.TimeOfDay)}", sun.TimeOfDay, 0f, 1f);
         DrawSlider(SpeedSliderTrack, $"Speed: {sun.SpeedMultiplier:0.0}x", sun.SpeedMultiplier, MinSpeed, MaxSpeed);
+    }
+
+    // The build icon plus, when open, a small palette of placeable items
+    // (currently just Campfire) — or, while an item is armed, a hint that
+    // placement mode is active instead of the palette itself.
+    static void DrawBuildMenu(BuildMenuState menu)
+    {
+        DrawButton(BuildButtonRect, "+", active: menu.Open || menu.Placing);
+
+        if (menu.Placing)
+        {
+            Raylib.DrawText("Click a tile to place the campfire (Esc / right-click to cancel)",
+                (int)BuildButtonRect.X, (int)(BuildButtonRect.Y + BuildButtonRect.Height + 6), 16, Color.Black);
+            return;
+        }
+
+        if (!menu.Open) return;
+
+        Raylib.DrawRectangleRec(BuildPanelRect, new Color(245, 245, 245, 235));
+        Raylib.DrawRectangleLinesEx(BuildPanelRect, 1.5f, Color.DarkGray);
+        DrawButton(CampfireItemRect, "Campfire");
     }
 
     // A gear-shaped icon button: a ring of teeth around a circular hub,
