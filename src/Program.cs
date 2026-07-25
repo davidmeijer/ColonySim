@@ -11,7 +11,7 @@ public static class Program
 {
     const int ScreenWidth = 1280;
     const int ScreenHeight = 720;
-    const int ActorCount = 10;
+    const int ActorCount = 3;
 
     // How far (in screen pixels) the mouse has to move while a button is held
     // before a press+release counts as a drag instead of a click.
