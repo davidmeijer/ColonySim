@@ -8,18 +8,23 @@ namespace ColonySim.World;
 
 // A voxel world with two grid resolutions layered on top of each other:
 //
-// - The COARSE grid (Width x Depth, TileSize world units per cell) is what
-//   pathfinding, walkability, tile occupancy, and digging all operate on —
-//   an actor occupies exactly one coarse tile, same as it always has.
 // - The FINE grid (Width*FineSubdivisions x Depth*FineSubdivisions,
-//   VoxelSize world units per cell — one coarse tile's worth of fine
-//   voxels is a 10x10 patch) is the real terrain data and what gets
-//   rendered: small real voxel cubes, not a blended/smoothed surface, so
-//   the ground has actual walls wherever height changes, but reads as
+//   VoxelSize world units per cell) is the real terrain data, what gets
+//   rendered (small real voxel cubes, not a blended/smoothed surface, so
+//   the ground has actual walls wherever height changes but reads as
 //   "smooth-ish" at normal viewing distance simply because the steps are
-//   small. A coarse tile's height/material (SurfaceY, TopMaterial, ...) is
-//   sampled from its centre fine column — a single representative value,
-//   consistent with "one coarse tile is one pathfinding unit".
+//   small), AND what movement/collision actually operates on: every
+//   placeable/movable thing (actors, trees, buildings, ...) has a square
+//   footprint (in fine voxels) and a height (see CanOccupy) — that
+//   footprint *is* its collision shape, positioned at any fine voxel, not
+//   snapped to a coarser lattice.
+// - The COARSE grid (Width x Depth, TileSize world units per cell) still
+//   exists purely as a rendering/UI convenience: terrain mesh chunking,
+//   mouse-ray tile picking (TryPickGround/ColumnBounds), and actor spawn
+//   scatter (WalkableTiles/FirstWalkable) all still think in coarse tiles,
+//   because that's cheap and none of them are collision-sensitive. Nothing
+//   in this file uses the coarse grid to decide whether something can move
+//   or be placed anywhere any more.
 public class TileMap
 {
   // Coarse pathfinding tile size, world units.
@@ -105,7 +110,6 @@ public class TileMap
   const float SpringFlowRate = 3f;
   const int SpringRadiusVoxels = 3;
   readonly List<Spring> _springs = new();
-  readonly HashSet<(int X, int Z)> _springTiles = new();
 
   // The disc a spring feeds, as offsets from its centre column. Precomputed
   // once since every spring uses the same shape every tick.
@@ -115,33 +119,43 @@ public class TileMap
      where dx * dx + dz * dz <= SpringRadiusVoxels * SpringRadiusVoxels
      select (dx, dz)).ToArray();
 
-  // Trees, scattered in clusters. Tracked by coarse tile: only one per
-  // tile, and a tiled tile blocks pathfinding just like rock or deep water
-  // — you can't walk through a trunk.
+  // Trees, scattered in clusters (see WorldGenerator.ScatterTrees) — one
+  // per coarse tile of clustering distance, but the actual collision
+  // footprint (Tree.Footprint fine voxels around its anchor) is much
+  // smaller than that whole tile; see _reservedVoxels/_obstacleHeight.
   readonly List<Tree> _trees = new();
-  readonly HashSet<(int X, int Z)> _treeTiles = new();
 
-  // Bushes, sprinkled individually. Blocks pathfinding the same way a tree
-  // does — an actor can't push through a shrub any more than a trunk.
+  // Bushes, sprinkled individually — same footprint-vs-scatter-distance
+  // split as trees.
   readonly List<Bush> _bushes = new();
-  readonly HashSet<(int X, int Z)> _bushTiles = new();
 
   // Campfires, placed by the player through the build menu (see
-  // Program.cs). Blocks pathfinding on its own tile — you can't stand in
-  // the fire — the same way a tree or bush tile does.
+  // Program.cs).
   readonly List<Campfire> _campfires = new();
-  readonly HashSet<(int X, int Z)> _campfireTiles = new();
 
   // Shared clock for flame-flicker animation (both the visible flame and
   // its point light read off this), and for how often scorched ground gets
   // refreshed — see UpdateVegetation.
   float _campfireTime;
 
-  // Light posts, placed by the player through the build menu. Unlike a
-  // campfire, a post doesn't block its own tile — it's a thin thing meant
-  // to sit right alongside (or on) a path without getting in anyone's way.
+  // Light posts, placed by the player through the build menu.
   readonly List<LightPost> _lightPosts = new();
-  readonly HashSet<(int X, int Z)> _lightPostTiles = new();
+
+  // Every fine voxel any footprint above (tree/bush/campfire/spring/light
+  // post) currently occupies — checked by placement validity so nothing
+  // new can overlap something already there, regardless of whether the
+  // existing occupant blocks movement (a Spring reserves space here but
+  // never enters _obstacleHeight, so actors still walk right over it).
+  readonly HashSet<(int Fx, int Fz)> _reservedVoxels = new();
+
+  // Only the fine voxels occupied by something with Height > 0 get an
+  // entry here (see CanOccupy) — Rock/deep-water aren't obstacles in this
+  // sense, they're a pure terrain check (VoxelTopAt/WaterDepthFine), and
+  // Spring (Height == 0) never adds one. The stored value is the
+  // occupant's own Height; CanOccupy doesn't compare it against a mover's
+  // height yet (see the type's own doc comment for why — multi-story
+  // floors are what will make that comparison matter).
+  readonly Dictionary<(int Fx, int Fz), int> _obstacleHeight = new();
 
   // Rendering: one Model per chunk of the fine grid. Tracked per chunk
   // (not one global flag) and rebuilt only where something actually
@@ -227,22 +241,16 @@ public class TileMap
       foreach (var (pos, waterDepth) in generated.Water)
         _waterSim.AddWater(pos.Fx, pos.Fz, waterDepth);
 
-      foreach (var tree in generated.Trees)
-      {
-        _trees.Add(tree);
-        _treeTiles.Add((tree.TileX, tree.TileZ));
-      }
+      foreach (var tree in generated.Trees) AddLoadedTree(tree);
+      foreach (var bush in generated.Bushes) AddLoadedBush(bush);
 
-      foreach (var bush in generated.Bushes)
-      {
-        _bushes.Add(bush);
-        _bushTiles.Add((bush.TileX, bush.TileZ));
-      }
-
+      // WorldGenerator's springs are coarse tile candidates (see
+      // WorldGenerator.HighestTile) — converted to a fine anchor here,
+      // same as every other footprint.
       foreach (var (springX, springZ) in generated.Springs)
       {
-        _springs.Add(new Spring(springX, springZ));
-        _springTiles.Add((springX, springZ));
+        var (fx, fz) = FineCenter(springX, springZ);
+        AddLoadedSpring(new Spring(fx, fz));
       }
     }
     else
@@ -280,34 +288,57 @@ public class TileMap
 
   public void SetWaterDepth(int fx, int fz, float depth) => _waterSim.SetDepth(fx, fz, depth);
 
+  // Marks every fine voxel of a size x size footprint centred on
+  // (anchorFx, anchorFz) as reserved, and — if height > 0 — as a movement
+  // obstacle of that height. Shared by every Place*/AddLoaded* below so
+  // there's exactly one place that keeps _reservedVoxels/_obstacleHeight
+  // in sync with what's actually placed.
+  void ReserveFootprint(int anchorFx, int anchorFz, int size, int height)
+  {
+    foreach (var (fx, fz) in FootprintVoxels(anchorFx, anchorFz, size))
+    {
+      _reservedVoxels.Add((fx, fz));
+      if (height > 0) _obstacleHeight[(fx, fz)] = height;
+    }
+  }
+
+  void UnreserveFootprint(int anchorFx, int anchorFz, int size)
+  {
+    foreach (var (fx, fz) in FootprintVoxels(anchorFx, anchorFz, size))
+    {
+      _reservedVoxels.Remove((fx, fz));
+      _obstacleHeight.Remove((fx, fz));
+    }
+  }
+
   public void AddLoadedTree(Tree tree)
   {
     _trees.Add(tree);
-    _treeTiles.Add((tree.TileX, tree.TileZ));
+    ReserveFootprint(tree.AnchorFx, tree.AnchorFz, Tree.Footprint, Tree.Height);
   }
 
   public void AddLoadedBush(Bush bush)
   {
     _bushes.Add(bush);
-    _bushTiles.Add((bush.TileX, bush.TileZ));
+    ReserveFootprint(bush.AnchorFx, bush.AnchorFz, Bush.Footprint, Bush.Height);
   }
 
   public void AddLoadedCampfire(Campfire campfire)
   {
     _campfires.Add(campfire);
-    _campfireTiles.Add((campfire.TileX, campfire.TileZ));
+    ReserveFootprint(campfire.AnchorFx, campfire.AnchorFz, Campfire.Footprint, Campfire.Height);
   }
 
   public void AddLoadedSpring(Spring spring)
   {
     _springs.Add(spring);
-    _springTiles.Add((spring.TileX, spring.TileZ));
+    ReserveFootprint(spring.AnchorFx, spring.AnchorFz, Spring.Footprint, Spring.Height);
   }
 
   public void AddLoadedLightPost(LightPost lightPost)
   {
     _lightPosts.Add(lightPost);
-    _lightPostTiles.Add((lightPost.TileX, lightPost.TileZ));
+    ReserveFootprint(lightPost.AnchorFx, lightPost.AnchorFz, LightPost.Footprint, LightPost.Height);
   }
 
   // Called once every voxel/tree/bush/campfire/spring/light post has been poured back
@@ -435,10 +466,7 @@ public class TileMap
       // without this, ordinary regrowth would eventually grass back over
       // ground right next to a fire that's still lit.
       foreach (var fire in _campfires)
-      {
-        var (fx, fz) = FineCenter(fire.TileX, fire.TileZ);
-        ScorchAround(fx, fz, ScorchRadiusVoxels);
-      }
+        ScorchAround(fire.AnchorFx, fire.AnchorFz, ScorchRadiusVoxels);
     }
   }
 
@@ -475,16 +503,22 @@ public class TileMap
     }
   }
 
-  // --- Coarse-grid queries (pathfinding, walkability, digging) ---
+  // --- Coarse-grid queries (rendering/UI convenience only — see this
+  // file's own class doc comment; nothing collision-related lives here
+  // any more) ---
 
   public bool InBounds(int x, int z) => x >= 0 && z >= 0 && x < Width && z < Depth;
 
-  (int Fx, int Fz) FineCenter(int coarseX, int coarseZ) =>
+  // The fine voxel at the centre of a coarse tile — used to seed a
+  // footprint anchor from a coarse-tile candidate (spawn scatter, springs'
+  // WorldGenerator.HighestTile) and by a few rendering helpers below that
+  // still sample "the" representative column of a coarse tile.
+  public (int Fx, int Fz) FineCenter(int coarseX, int coarseZ) =>
     (coarseX * FineSubdivisions + FineSubdivisions / 2, coarseZ * FineSubdivisions + FineSubdivisions / 2);
 
   // A coarse tile's height in fine voxels, sampled at its centre fine
-  // column — the single representative value pathfinding and walkability
-  // treat that whole tile as having.
+  // column — the single representative value a few rendering helpers
+  // (SurfaceY, ColumnBounds, ...) treat that whole tile as having.
   public int HeightLevels(int x, int z)
   {
     if (!InBounds(x, z)) return 0;
@@ -654,15 +688,14 @@ public class TileMap
   // hover/queued-task highlight at the right height.
   public int VoxelHeightAt(int fx, int fz) => InBoundsFine(fx, fz) ? _voxelHeight[fx, fz] : 0;
 
-  // Whether a specific fine column can be dug: bounded, its parent coarse
-  // tile has to be otherwise workable ground (no rock/tree/bush/campfire/
-  // deep water — same rule IsWalkable already encodes), the column itself
-  // has to have material left with a Grass/Dirt top (not bedrock), and it
-  // can't be sitting under standing water.
+  // Whether a specific fine column can be dug: bounded, not sitting under
+  // something that actually occupies that exact voxel (a tree trunk, a
+  // campfire, ...), has material left with a Grass/Dirt top (not bedrock),
+  // and isn't under standing water.
   public bool CanDigVoxel(int fx, int fz)
   {
     if (!InBoundsFine(fx, fz)) return false;
-    if (!IsWalkable(fx / FineSubdivisions, fz / FineSubdivisions)) return false;
+    if (_obstacleHeight.ContainsKey((fx, fz))) return false;
     if (_voxelHeight[fx, fz] <= 0) return false;
     var top = _voxelTop[fx, fz];
     if (top != TileType.Grass && top != TileType.Dirt) return false;
@@ -670,12 +703,12 @@ public class TileMap
   }
 
   // Whether a specific fine column has room to grow by one more voxel —
-  // same parent-tile and water gating as CanDigVoxel, just checking height
-  // room instead of material to remove.
+  // same obstacle/water gating as CanDigVoxel, just checking height room
+  // instead of material to remove.
   public bool CanDepositVoxel(int fx, int fz)
   {
     if (!InBoundsFine(fx, fz)) return false;
-    if (!IsWalkable(fx / FineSubdivisions, fz / FineSubdivisions)) return false;
+    if (_obstacleHeight.ContainsKey((fx, fz))) return false;
     if (_voxelHeight[fx, fz] >= MaxHeight * FineSubdivisions) return false;
     return _waterSim.DepthAt(fx, fz) <= 0f;
   }
@@ -710,42 +743,48 @@ public class TileMap
   // around it — see ScorchAround.
   const float ScorchRadiusVoxels = 16f;
 
-  // A spot has to be ordinary open ground: walkable, dry, and not already
-  // occupied by another campfire.
-  public bool CanPlaceCampfire(int x, int z) =>
-    IsWalkable(x, z) && WaterDepth(x, z) <= 0f && !_campfireTiles.Contains((x, z));
-
-  // Places a lit campfire on a coarse tile, immediately scorching the grass
-  // around it (see ScorchAround) and blocking that tile from pathfinding —
-  // an actor can't stand in the fire, the same way it can't stand in a
-  // tree. Returns null without changing anything if the spot isn't valid;
-  // callers should check CanPlaceCampfire first if they want to know why.
-  public Campfire? PlaceCampfire(int x, int z)
+  // A spot has to have its whole footprint on ordinary open ground: in
+  // bounds, no Rock, dry throughout, and not already reserved by another
+  // footprint (tree/bush/another campfire/spring/light post).
+  public bool CanPlaceCampfire(int anchorFx, int anchorFz)
   {
-    if (!CanPlaceCampfire(x, z)) return null;
+    if (!FootprintClear(anchorFx, anchorFz, Campfire.Footprint)) return false;
+    foreach (var (fx, fz) in FootprintVoxels(anchorFx, anchorFz, Campfire.Footprint))
+      if (_waterSim.DepthAt(fx, fz) > 0f) return false;
+    return true;
+  }
 
-    var fire = new Campfire(x, z, Random.Shared.NextSingle() * MathF.Tau);
+  // Places a lit campfire anchored at a fine voxel, immediately scorching
+  // the grass around it (see ScorchAround) and blocking its whole
+  // footprint from movement — an actor can't stand in the fire, the same
+  // way it can't stand in a tree. Returns null without changing anything
+  // if the spot isn't valid; callers should check CanPlaceCampfire first
+  // if they want to know why.
+  public Campfire? PlaceCampfire(int anchorFx, int anchorFz)
+  {
+    if (!CanPlaceCampfire(anchorFx, anchorFz)) return null;
+
+    var fire = new Campfire(anchorFx, anchorFz, Random.Shared.NextSingle() * MathF.Tau);
     _campfires.Add(fire);
-    _campfireTiles.Add((x, z));
+    ReserveFootprint(anchorFx, anchorFz, Campfire.Footprint, Campfire.Height);
 
-    var (fx, fz) = FineCenter(x, z);
-    ScorchAround(fx, fz, ScorchRadiusVoxels);
+    ScorchAround(anchorFx, anchorFz, ScorchRadiusVoxels);
     return fire;
   }
 
   // Tears down a campfire a DemolishCampfire task has finished working —
-  // frees its tile back up for pathfinding. Leaves the scorched ground
+  // frees its footprint back up for movement. Leaves the scorched ground
   // alone; ordinary regrowth (see StepRegrowth) will grass it back over in
   // time same as any other patch of dry Dirt. Returns false if there was no
-  // campfire on that tile to begin with (shouldn't happen in practice,
+  // campfire at that anchor to begin with (shouldn't happen in practice,
   // since WorkQueue prunes a demolish task the moment its target vanishes).
-  public bool RemoveCampfire(int x, int z)
+  public bool RemoveCampfire(int anchorFx, int anchorFz)
   {
-    int index = _campfires.FindIndex(f => f.TileX == x && f.TileZ == z);
+    int index = _campfires.FindIndex(f => f.AnchorFx == anchorFx && f.AnchorFz == anchorFz);
     if (index < 0) return false;
 
     _campfires.RemoveAt(index);
-    _campfireTiles.Remove((x, z));
+    UnreserveFootprint(anchorFx, anchorFz, Campfire.Footprint);
     return true;
   }
 
@@ -793,68 +832,105 @@ public class TileMap
   {
     foreach (var fire in _campfires)
     {
-      float worldX = fire.TileX * TileSize + TileSize / 2f;
-      float worldZ = fire.TileZ * TileSize + TileSize / 2f;
+      float worldX = fire.AnchorFx * VoxelSize + VoxelSize / 2f;
+      float worldZ = fire.AnchorFz * VoxelSize + VoxelSize / 2f;
       float baseY = SmoothSurfaceY(worldX, worldZ);
       Vector3 pos = new(worldX, baseY + CampfireLightHeight, worldZ);
       yield return (pos, CampfireLightColor * Flicker(fire.FlickerPhase));
     }
   }
 
-  // Whether an actor standing at (fromX, fromZ) can take one step onto the
-  // adjacent tile (toX, toZ): the destination has to be walkable on its
-  // own terms, and the climb can't be steeper than half an old block.
-  // Stepping down is never limited — only climbing.
-  public bool CanStep(int fromX, int fromZ, int toX, int toZ)
+  // --- Footprint collision (the real movement/placement rule) -----------
+  //
+  // Every placeable/movable thing is a size x size square of fine voxels
+  // centred on an anchor voxel (see e.g. Campfire.Footprint) plus a height
+  // (see e.g. Campfire.Height). This is the single shared "does this
+  // footprint fit here" check both pathfinding (via CanStep) and building
+  // placement (via CanPlaceCampfire/etc., layered with their own extra
+  // rules like dryness) are built from.
+
+  // The min/max fine-voxel corners of a size x size footprint centred on
+  // (anchorFx, anchorFz). size is always odd for every type in this game,
+  // so the anchor sits exactly in the middle — no rounding bias.
+  public static (int MinFx, int MinFz, int MaxFx, int MaxFz) FootprintBounds(int anchorFx, int anchorFz, int size)
   {
-    if (!IsWalkable(toX, toZ)) return false;
-    return EdgeRise(fromX, fromZ, toX, toZ) <= MaxStepUpLevels;
+    int half = size / 2;
+    int minFx = anchorFx - half, minFz = anchorFz - half;
+    return (minFx, minFz, minFx + size - 1, minFz + size - 1);
   }
 
-  // The height an actor actually has to climb crossing directly from one
-  // coarse tile into the next. Deliberately NOT the two tiles' single
-  // centre fine columns (one point out of the 100 in each tile) — on
-  // rolling terrain that single sample is easily unrepresentative of the
-  // tile as a whole, which is exactly what let a visually gradual ramp get
-  // rejected as an unclimbable cliff. Instead this walks every fine-voxel
-  // column pair straddling the shared border — the actual ground an actor's
-  // feet cross when it takes the step — and takes the median rise across
-  // it, so a genuinely gradual slope reads as gradual even when a column
-  // or two right on the border is locally bumpy, while a real step/cliff
-  // spanning most of the border still reads as one.
-  int EdgeRise(int fromX, int fromZ, int toX, int toZ)
+  public static IEnumerable<(int Fx, int Fz)> FootprintVoxels(int anchorFx, int anchorFz, int size)
   {
-    var rises = new List<int>(FineSubdivisions);
-    foreach (var (fromFx, fromFz, toFx, toFz) in BorderColumnPairs(fromX, fromZ, toX, toZ))
-      rises.Add(_voxelHeight[toFx, toFz] - _voxelHeight[fromFx, fromFz]);
-    rises.Sort();
-    return rises[rises.Count / 2];
+    var (minFx, minFz, maxFx, maxFz) = FootprintBounds(anchorFx, anchorFz, size);
+    for (int fx = minFx; fx <= maxFx; fx++)
+      for (int fz = minFz; fz <= maxFz; fz++)
+        yield return (fx, fz);
   }
 
-  // The FineSubdivisions fine-voxel column pairs directly facing each
-  // other across the shared border of two orthogonally adjacent coarse
-  // tiles — the last column of `from` against the first column of `to`.
-  // Pathfinding is 4-directional only, so exactly one of dx/dz is nonzero.
-  IEnumerable<(int FromFx, int FromFz, int ToFx, int ToFz)> BorderColumnPairs(int fromX, int fromZ, int toX, int toZ)
+  public bool FootprintInBounds(int anchorFx, int anchorFz, int size)
   {
-    int dx = toX - fromX, dz = toZ - fromZ;
-    int fromFx0 = fromX * FineSubdivisions, fromFz0 = fromZ * FineSubdivisions;
-    int toFx0 = toX * FineSubdivisions, toFz0 = toZ * FineSubdivisions;
+    var (minFx, minFz, maxFx, maxFz) = FootprintBounds(anchorFx, anchorFz, size);
+    return InBoundsFine(minFx, minFz) && InBoundsFine(maxFx, maxFz);
+  }
 
-    if (dx != 0)
+  // Whether a footprint's exact voxel at (fx, fz) falls within an existing
+  // footprint anchored at (anchorFx, anchorFz) — used to hit-test an
+  // existing building from anywhere in its footprint (a demolish click
+  // anywhere on a campfire, not just its exact anchor pixel).
+  public static bool FootprintContains(int anchorFx, int anchorFz, int size, int fx, int fz)
+  {
+    var (minFx, minFz, maxFx, maxFz) = FootprintBounds(anchorFx, anchorFz, size);
+    return fx >= minFx && fx <= maxFx && fz >= minFz && fz <= maxFz;
+  }
+
+  // Whether a NEW footprint has room to go here: in bounds, no Rock
+  // anywhere under it, and not overlapping anything already reserved
+  // (tree/bush/campfire/spring/light post) — the common placement check
+  // every CanPlace* shares before layering its own extra rules (dryness
+  // for a campfire, none for a spring/light post) on top.
+  bool FootprintClear(int anchorFx, int anchorFz, int size)
+  {
+    if (!FootprintInBounds(anchorFx, anchorFz, size)) return false;
+    foreach (var (fx, fz) in FootprintVoxels(anchorFx, anchorFz, size))
     {
-      int fromFx = dx > 0 ? fromFx0 + FineSubdivisions - 1 : fromFx0;
-      int toFx = dx > 0 ? toFx0 : toFx0 + FineSubdivisions - 1;
-      for (int i = 0; i < FineSubdivisions; i++)
-        yield return (fromFx, fromFz0 + i, toFx, fromFz0 + i);
+      if (VoxelTopAt(fx, fz) == TileType.Rock) return false;
+      if (_reservedVoxels.Contains((fx, fz))) return false;
     }
-    else
+    return true;
+  }
+
+  // Whether a mover with the given footprint/height could stand with its
+  // footprint centred on (anchorFx, anchorFz) right now: every voxel in
+  // bounds, no Rock, no water too deep to wade, and no obstacle occupying
+  // it. height isn't compared against anything yet — see _obstacleHeight's
+  // own doc comment for why it's still threaded through (multi-story
+  // floors are what will make the comparison matter; today any obstacle
+  // voxel simply blocks, since every mover and every obstacle share the
+  // same ground-level base).
+  public bool CanOccupy(int anchorFx, int anchorFz, int footprintSize, int height)
+  {
+    if (!FootprintInBounds(anchorFx, anchorFz, footprintSize)) return false;
+    foreach (var (fx, fz) in FootprintVoxels(anchorFx, anchorFz, footprintSize))
     {
-      int fromFz = dz > 0 ? fromFz0 + FineSubdivisions - 1 : fromFz0;
-      int toFz = dz > 0 ? toFz0 : toFz0 + FineSubdivisions - 1;
-      for (int i = 0; i < FineSubdivisions; i++)
-        yield return (fromFx0 + i, fromFz, fromFx0 + i, toFz);
+      if (VoxelTopAt(fx, fz) == TileType.Rock) return false;
+      if (_waterSim.DepthAt(fx, fz) > MaxWadeableWaterVoxels) return false;
+      if (_obstacleHeight.ContainsKey((fx, fz))) return false;
     }
+    return true;
+  }
+
+  // Whether a mover can take one step from its footprint centred at
+  // (fromFx, fromFz) to one centred at the adjacent (toFx, toFz): the
+  // destination has to be occupiable on its own terms, and the climb
+  // (compared at the two anchors — footprints wider than 1 voxel only
+  // check their own centre column's rise, a reasonable approximation until
+  // something bigger than today's 1-voxel actor default actually exists)
+  // can't be steeper than half an old block. Stepping down is never
+  // limited — only climbing.
+  public bool CanStep(int fromFx, int fromFz, int toFx, int toFz, int footprintSize, int height)
+  {
+    if (!CanOccupy(toFx, toFz, footprintSize, height)) return false;
+    return _voxelHeight[toFx, toFz] - _voxelHeight[fromFx, fromFz] <= MaxStepUpLevels;
   }
 
   // How many voxels of water are sitting on a coarse tile, sampled at its
@@ -876,18 +952,17 @@ public class TileMap
   // rim, or whether a basin is still filling.
   public float TotalWaterVolume() => _waterSim.TotalVolume();
 
-  // Bare rock faces block movement, so does water too deep to wade, and so
-  // does a tree, a bush, or a lit campfire — you can't walk through a
-  // trunk, a shrub, or a fire.
+  // Coarse "is roughly walkable" check — used ONLY for actor spawn scatter
+  // (WalkableTiles/FirstWalkable) below, nowhere movement-related any more
+  // (see CanOccupy, which is what pathfinding actually uses). Samples the
+  // tile's centre fine voxel with a 1-voxel footprint; the height argument
+  // doesn't affect the result yet (see CanOccupy's own note), so any value
+  // works here.
   public bool IsWalkable(int x, int z)
   {
     if (!InBounds(x, z)) return false;
-    if (TopMaterial(x, z) == TileType.Rock) return false;
-    if (WaterDepth(x, z) > MaxWadeableWaterVoxels) return false;
-    if (_treeTiles.Contains((x, z))) return false;
-    if (_bushTiles.Contains((x, z))) return false;
-    if (_campfireTiles.Contains((x, z))) return false;
-    return true;
+    var (fx, fz) = FineCenter(x, z);
+    return CanOccupy(fx, fz, 1, 0);
   }
 
   // Find any walkable tile: used to place an actor at startup.
@@ -938,10 +1013,9 @@ public class TileMap
 
       foreach (var spring in _springs)
       {
-        var (cfx, cfz) = FineCenter(spring.TileX, spring.TileZ);
         float perColumn = SpringFlowRate / SpringDisc.Length;
         foreach (var (dx, dz) in SpringDisc)
-          _waterSim.AddWater(cfx + dx, cfz + dz, perColumn);
+          _waterSim.AddWater(spring.AnchorFx + dx, spring.AnchorFz + dz, perColumn);
       }
 
       _waterSim.Step();
@@ -986,29 +1060,25 @@ public class TileMap
   public IReadOnlyList<Spring> Springs => _springs;
 
   // Same siting rule as a campfire — ordinary open ground, nothing already
-  // on it — except that a spring is allowed on wet ground. Placing one in
-  // a pond to raise its level is a perfectly reasonable thing to want, and
-  // unlike a fire there is nothing about a spring that water ruins.
-  public bool CanPlaceSpring(int x, int z) =>
-    InBounds(x, z) &&
-    TopMaterial(x, z) != TileType.Rock &&
-    !_treeTiles.Contains((x, z)) &&
-    !_bushTiles.Contains((x, z)) &&
-    !_campfireTiles.Contains((x, z)) &&
-    !_springTiles.Contains((x, z));
+  // reserved there — except that a spring is allowed on wet ground.
+  // Placing one in a pond to raise its level is a perfectly reasonable
+  // thing to want, and unlike a fire there is nothing about a spring that
+  // water ruins. Spring.Height is 0, so it's never a movement obstacle
+  // (ReserveFootprint below only adds an _obstacleHeight entry for
+  // Height > 0) — an actor still walks straight over it.
+  public bool CanPlaceSpring(int anchorFx, int anchorFz) => FootprintClear(anchorFx, anchorFz, Spring.Footprint);
 
-  public Spring? PlaceSpring(int x, int z)
+  public Spring? PlaceSpring(int anchorFx, int anchorFz)
   {
-    if (!CanPlaceSpring(x, z)) return null;
+    if (!CanPlaceSpring(anchorFx, anchorFz)) return null;
 
-    var spring = new Spring(x, z);
+    var spring = new Spring(anchorFx, anchorFz);
     _springs.Add(spring);
-    _springTiles.Add((x, z));
+    ReserveFootprint(anchorFx, anchorFz, Spring.Footprint, Spring.Height);
 
     // Wake the sim at the spring's own column, so its first tick of water
     // is simulated even if it was placed nowhere near any existing water.
-    var (fx, fz) = FineCenter(x, z);
-    _waterSim.Touch(fx, fz);
+    _waterSim.Touch(anchorFx, anchorFz);
     return spring;
   }
 
@@ -1016,13 +1086,13 @@ public class TileMap
   // is: it drains off the map rim if it can reach one, and otherwise just
   // sits there like any other pond. That's the point of being able to cap
   // one — it stops the supply, it doesn't undo the flood.
-  public bool RemoveSpring(int x, int z)
+  public bool RemoveSpring(int anchorFx, int anchorFz)
   {
-    int index = _springs.FindIndex(s => s.TileX == x && s.TileZ == z);
+    int index = _springs.FindIndex(s => s.AnchorFx == anchorFx && s.AnchorFz == anchorFz);
     if (index < 0) return false;
 
     _springs.RemoveAt(index);
-    _springTiles.Remove((x, z));
+    UnreserveFootprint(anchorFx, anchorFz, Spring.Footprint);
     return true;
   }
 
@@ -1030,36 +1100,28 @@ public class TileMap
 
   public IReadOnlyList<LightPost> LightPosts => _lightPosts;
 
-  // Same open-ground rule as a spring — doesn't need to be dry (a post next
-  // to water is exactly where you'd want one) and doesn't check IsWalkable,
-  // since a post is allowed to stand on ground something else already
-  // occupies-adjacent-to; it just can't double up on another post or a tree/
-  // bush/campfire actually sitting on the same tile.
-  public bool CanPlaceLightPost(int x, int z) =>
-    InBounds(x, z) &&
-    TopMaterial(x, z) != TileType.Rock &&
-    !_treeTiles.Contains((x, z)) &&
-    !_bushTiles.Contains((x, z)) &&
-    !_campfireTiles.Contains((x, z)) &&
-    !_lightPostTiles.Contains((x, z));
+  // Same open-ground rule as a spring, minus the "allowed on wet ground"
+  // exception (a post doesn't care about water either way, so the plain
+  // FootprintClear rule already covers it — no extra dryness check needed).
+  public bool CanPlaceLightPost(int anchorFx, int anchorFz) => FootprintClear(anchorFx, anchorFz, LightPost.Footprint);
 
-  public LightPost? PlaceLightPost(int x, int z)
+  public LightPost? PlaceLightPost(int anchorFx, int anchorFz)
   {
-    if (!CanPlaceLightPost(x, z)) return null;
+    if (!CanPlaceLightPost(anchorFx, anchorFz)) return null;
 
-    var post = new LightPost(x, z);
+    var post = new LightPost(anchorFx, anchorFz);
     _lightPosts.Add(post);
-    _lightPostTiles.Add((x, z));
+    ReserveFootprint(anchorFx, anchorFz, LightPost.Footprint, LightPost.Height);
     return post;
   }
 
-  public bool RemoveLightPost(int x, int z)
+  public bool RemoveLightPost(int anchorFx, int anchorFz)
   {
-    int index = _lightPosts.FindIndex(l => l.TileX == x && l.TileZ == z);
+    int index = _lightPosts.FindIndex(l => l.AnchorFx == anchorFx && l.AnchorFz == anchorFz);
     if (index < 0) return false;
 
     _lightPosts.RemoveAt(index);
-    _lightPostTiles.Remove((x, z));
+    UnreserveFootprint(anchorFx, anchorFz, LightPost.Footprint);
     return true;
   }
 
@@ -1075,8 +1137,8 @@ public class TileMap
   {
     foreach (var post in _lightPosts)
     {
-      float worldX = post.TileX * TileSize + TileSize / 2f;
-      float worldZ = post.TileZ * TileSize + TileSize / 2f;
+      float worldX = post.AnchorFx * VoxelSize + VoxelSize / 2f;
+      float worldZ = post.AnchorFz * VoxelSize + VoxelSize / 2f;
       float baseY = SmoothSurfaceY(worldX, worldZ);
       yield return (new Vector3(worldX, baseY + LightPostLightHeight, worldZ), LightPostLightColor);
     }
@@ -1361,8 +1423,8 @@ public class TileMap
   {
     foreach (var tree in _trees)
     {
-      float worldX = tree.TileX * TileSize + TileSize / 2f;
-      float worldZ = tree.TileZ * TileSize + TileSize / 2f;
+      float worldX = tree.AnchorFx * VoxelSize + VoxelSize / 2f;
+      float worldZ = tree.AnchorFz * VoxelSize + VoxelSize / 2f;
       float baseY = SmoothSurfaceY(worldX, worldZ);
 
       for (int i = 0; i < tree.TrunkHeight; i++)
@@ -1392,8 +1454,8 @@ public class TileMap
   {
     foreach (var bush in _bushes)
     {
-      float worldX = bush.TileX * TileSize + TileSize / 2f;
-      float worldZ = bush.TileZ * TileSize + TileSize / 2f;
+      float worldX = bush.AnchorFx * VoxelSize + VoxelSize / 2f;
+      float worldZ = bush.AnchorFz * VoxelSize + VoxelSize / 2f;
       float baseY = SmoothSurfaceY(worldX, worldZ);
 
       float sizeMul = 0.85f + bush.SizeVariant * 0.15f; // 0.85 / 1.0 / 1.15
@@ -1425,8 +1487,8 @@ public class TileMap
   {
     foreach (var fire in _campfires)
     {
-      float worldX = fire.TileX * TileSize + TileSize / 2f;
-      float worldZ = fire.TileZ * TileSize + TileSize / 2f;
+      float worldX = fire.AnchorFx * VoxelSize + VoxelSize / 2f;
+      float worldZ = fire.AnchorFz * VoxelSize + VoxelSize / 2f;
       float baseY = SmoothSurfaceY(worldX, worldZ);
 
       Vector3 logCenter = new(worldX, baseY + LogThickness / 2f, worldZ);
@@ -1462,8 +1524,8 @@ public class TileMap
   {
     foreach (var fire in _campfires)
     {
-      float worldX = fire.TileX * TileSize + TileSize / 2f;
-      float worldZ = fire.TileZ * TileSize + TileSize / 2f;
+      float worldX = fire.AnchorFx * VoxelSize + VoxelSize / 2f;
+      float worldZ = fire.AnchorFz * VoxelSize + VoxelSize / 2f;
       float baseY = SmoothSurfaceY(worldX, worldZ);
       float flicker = Flicker(fire.FlickerPhase);
 
@@ -1700,8 +1762,8 @@ public class TileMap
   {
     foreach (var spring in _springs)
     {
-      float worldX = spring.TileX * TileSize + TileSize / 2f;
-      float worldZ = spring.TileZ * TileSize + TileSize / 2f;
+      float worldX = spring.AnchorFx * VoxelSize + VoxelSize / 2f;
+      float worldZ = spring.AnchorFz * VoxelSize + VoxelSize / 2f;
       float baseY = SmoothSurfaceY(worldX, worldZ);
 
       Raylib.DrawCube(
@@ -1731,8 +1793,8 @@ public class TileMap
   {
     foreach (var post in _lightPosts)
     {
-      float worldX = post.TileX * TileSize + TileSize / 2f;
-      float worldZ = post.TileZ * TileSize + TileSize / 2f;
+      float worldX = post.AnchorFx * VoxelSize + VoxelSize / 2f;
+      float worldZ = post.AnchorFz * VoxelSize + VoxelSize / 2f;
       float baseY = SmoothSurfaceY(worldX, worldZ);
 
       Vector3 stickCenter = new(worldX, baseY + PostHeight / 2f, worldZ);
@@ -1751,8 +1813,8 @@ public class TileMap
   {
     foreach (var post in _lightPosts)
     {
-      float worldX = post.TileX * TileSize + TileSize / 2f;
-      float worldZ = post.TileZ * TileSize + TileSize / 2f;
+      float worldX = post.AnchorFx * VoxelSize + VoxelSize / 2f;
+      float worldZ = post.AnchorFz * VoxelSize + VoxelSize / 2f;
       float baseY = SmoothSurfaceY(worldX, worldZ);
 
       Vector3 capCenter = new(worldX, baseY + PostHeight + PostCapSize / 2f, worldZ);

@@ -22,7 +22,7 @@ public static class SaveSystem
   // Bumped whenever the file layout below changes, so a save from an older
   // build fails loudly (see Load) instead of silently misreading fields.
   const uint Magic = 0x4D495343; // "CSIM"
-  const int Version = 2;
+  const int Version = 3;
 
   public static void Save(string path, Program.GameSession session)
   {
@@ -55,39 +55,39 @@ public static class SaveSystem
     w.Write(map.Trees.Count);
     foreach (var t in map.Trees)
     {
-      w.Write(t.TileX); w.Write(t.TileZ);
+      w.Write(t.AnchorFx); w.Write(t.AnchorFz);
       w.Write(t.TrunkHeight); w.Write(t.CanopyHeight);
     }
 
     w.Write(map.Bushes.Count);
     foreach (var b in map.Bushes)
     {
-      w.Write(b.TileX); w.Write(b.TileZ);
+      w.Write(b.AnchorFx); w.Write(b.AnchorFz);
       w.Write(b.Layers); w.Write(b.SizeVariant); w.Write(b.ColorVariant);
     }
 
     w.Write(map.Campfires.Count);
     foreach (var c in map.Campfires)
     {
-      w.Write(c.TileX); w.Write(c.TileZ); w.Write(c.FlickerPhase);
+      w.Write(c.AnchorFx); w.Write(c.AnchorFz); w.Write(c.FlickerPhase);
     }
 
     w.Write(map.Springs.Count);
     foreach (var s in map.Springs)
     {
-      w.Write(s.TileX); w.Write(s.TileZ);
+      w.Write(s.AnchorFx); w.Write(s.AnchorFz);
     }
 
     w.Write(map.LightPosts.Count);
     foreach (var l in map.LightPosts)
     {
-      w.Write(l.TileX); w.Write(l.TileZ);
+      w.Write(l.AnchorFx); w.Write(l.AnchorFz);
     }
 
     w.Write(session.Actors.Count);
     foreach (var a in session.Actors)
     {
-      w.Write(a.TileX); w.Write(a.TileZ); w.Write(a.IsBuilder);
+      w.Write(a.FineX); w.Write(a.FineZ); w.Write(a.IsBuilder);
     }
 
     w.Write(session.GlobalInventory.Counts.Count);
@@ -105,9 +105,8 @@ public static class SaveSystem
     foreach (var t in session.WorkQueue.Tasks)
     {
       w.Write((byte)t.Kind);
-      w.Write(t.TileX); w.Write(t.TileZ);
-      w.Write(t.StandX); w.Write(t.StandZ);
       w.Write(t.FineX); w.Write(t.FineZ);
+      w.Write(t.StandX); w.Write(t.StandZ);
       w.Write(t.Duration);
       w.Write(t.Progress);
     }
@@ -178,9 +177,9 @@ public static class SaveSystem
     var actors = new List<Actor>(actorCount);
     for (int i = 0; i < actorCount; i++)
     {
-      int tx = r.ReadInt32(), tz = r.ReadInt32();
+      int fx = r.ReadInt32(), fz = r.ReadInt32();
       bool isBuilder = r.ReadBoolean();
-      actors.Add(new Actor(map, tx, tz) { IsBuilder = isBuilder });
+      actors.Add(new Actor(map, fx, fz) { IsBuilder = isBuilder });
     }
 
     var globalInventory = new Inventory(capacity: 100_000);
@@ -197,16 +196,12 @@ public static class SaveSystem
     for (int i = 0; i < taskCount; i++)
     {
       var kind = (TaskKind)r.ReadByte();
-      int tileX = r.ReadInt32(), tileZ = r.ReadInt32();
-      int standX = r.ReadInt32(), standZ = r.ReadInt32();
       int fineX = r.ReadInt32(), fineZ = r.ReadInt32();
+      int standX = r.ReadInt32(), standZ = r.ReadInt32();
       float duration = r.ReadSingle();
       float progress = r.ReadSingle();
 
-      var task = kind is TaskKind.Dig or TaskKind.Deposit
-        ? WorkTask.ForVoxel(kind, fineX, fineZ, duration)
-        : WorkTask.ForTile(kind, tileX, tileZ, standX, standZ, duration);
-      task.Progress = progress;
+      var task = new WorkTask(kind, fineX, fineZ, standX, standZ, duration) { Progress = progress };
       workQueue.Enqueue(task);
     }
 

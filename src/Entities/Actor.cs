@@ -6,9 +6,23 @@ namespace ColonySim.Entities;
 
 public class Actor
 {
-  // The tile the actor currently occupies.
-  public int TileX { get; private set; }
-  public int TileZ { get; private set; }
+  // The fine voxel the actor currently occupies — movement/pathfinding run
+  // entirely on the fine grid now (see TileMap's own class doc comment).
+  public int FineX { get; private set; }
+  public int FineZ { get; private set; }
+
+  // This actor's own collision footprint/height, in fine voxels — see
+  // TileMap.CanOccupy. 1x1 is the smallest sane default; the check
+  // machinery itself supports any size mover. HeightVoxels is derived from
+  // the actual rendered body height below (LegHeight+TorsoHeight+HeadSize)
+  // rather than a made-up number, so it stays truthful to the model. Not
+  // load-bearing for collision yet (obstacles don't compare a mover's
+  // height against their own — see TileMap's _obstacleHeight doc comment)
+  // — stored now so the actor is already "tall" in the same terms an
+  // obstacle is, ready for when standing on a future floor makes the
+  // comparison matter.
+  public const int FootprintSize = 1;
+  public const int HeightVoxels = (int)((LegHeight + TorsoHeight + HeadSize) / TileMap.VoxelSize);
 
   // Whether this actor is part of the current selection (for input + the
   // selection ring drawn under it).
@@ -192,23 +206,23 @@ public class Actor
   // Draw* methods so they agree on where the limbs are this frame.
   float _poseLeftLegDeg, _poseRightLegDeg, _poseLeftArmDeg, _poseRightArmDeg, _poseTorsoLeanDeg, _poseBreathLift;
 
-  public Actor(TileMap map, int tileX, int tileZ)
+  public Actor(TileMap map, int fineX, int fineZ)
   {
     _map = map;
-    TileX = tileX;
-    TileZ = tileZ;
-    _worldPos = TileTop(tileX, tileZ);
+    FineX = fineX;
+    FineZ = fineZ;
+    _worldPos = VoxelTop(fineX, fineZ);
     _shirtColor = ShirtPalette[_nextShirtIndex++ % ShirtPalette.Length];
   }
 
-  // The ground position at the centre of a (pathfinding) tile — where this
-  // actor's feet belong. Samples the real fine-voxel terrain height, not
-  // just the tile's coarse representative height, so an actor's feet always
-  // match the actual rendered surface it's standing on.
-  Vector3 TileTop(int x, int z)
+  // The ground position at the centre of a fine voxel — where this actor's
+  // feet belong. Samples the real fine-voxel terrain height directly, so
+  // an actor's feet always match the actual rendered surface it's
+  // standing on.
+  Vector3 VoxelTop(int fx, int fz)
   {
-    float worldX = x * TileMap.TileSize + TileMap.TileSize / 2f;
-    float worldZ = z * TileMap.TileSize + TileMap.TileSize / 2f;
+    float worldX = fx * TileMap.VoxelSize + TileMap.VoxelSize / 2f;
+    float worldZ = fz * TileMap.VoxelSize + TileMap.VoxelSize / 2f;
     return new Vector3(worldX, _map.SmoothSurfaceY(worldX, worldZ), worldZ);
   }
 
@@ -279,8 +293,8 @@ public class Actor
     else
     {
       var next = _path.Peek();
-      float targetX = next.X * TileMap.TileSize + TileMap.TileSize / 2f;
-      float targetZ = next.Y * TileMap.TileSize + TileMap.TileSize / 2f;
+      float targetX = next.X * TileMap.VoxelSize + TileMap.VoxelSize / 2f;
+      float targetZ = next.Y * TileMap.VoxelSize + TileMap.VoxelSize / 2f;
 
       float dx = targetX - _worldPos.X;
       float dz = targetZ - _worldPos.Z;
@@ -296,11 +310,11 @@ public class Actor
 
       if (dist <= step)
       {
-        // Close enough to count as "arrived": snap onto the tile and pop it.
+        // Close enough to count as "arrived": snap onto the voxel and pop it.
         _worldPos.X = targetX;
         _worldPos.Z = targetZ;
-        TileX = next.X;
-        TileZ = next.Y;
+        FineX = next.X;
+        FineZ = next.Y;
         _path.Dequeue();
         ResetProgress();
         _totalStuckTime = 0f;
@@ -518,7 +532,7 @@ public class Actor
     {
       foreach (var (x, y) in _path)
       {
-        Vector3 top = TileTop(x, y);
+        Vector3 top = VoxelTop(x, y);
         Raylib.DrawSphere(new Vector3(top.X, top.Y + 2f, top.Z), 3f, Color.Yellow);
       }
     }
@@ -616,8 +630,10 @@ public class Actor
     if (Selected)
     {
       // The selection ring stays on the ground even mid-jump, so it still
-      // reads as "this tile" rather than following the actor into the air.
-      Vector3 ringCenter = new(_worldPos.X, _map.SurfaceY(TileX, TileZ) + 1f, _worldPos.Z);
+      // reads as "here" rather than following the actor into the air — that
+      // means it can't just reuse _worldPos.Y, which already includes the
+      // jump arc; re-sample the ground height directly instead.
+      Vector3 ringCenter = new(_worldPos.X, _map.SmoothSurfaceY(_worldPos.X, _worldPos.Z) + 1f, _worldPos.Z);
       Raylib.DrawCircle3D(ringCenter, Radius * 1.6f, new Vector3(1f, 0f, 0f), 90f, Color.Lime);
     }
   }

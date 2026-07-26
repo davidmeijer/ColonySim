@@ -40,12 +40,12 @@ public class WorkQueue
   {
     TaskKind.Dig => !map.CanDigVoxel(t.FineX, t.FineZ),
     TaskKind.Deposit => !map.CanDepositVoxel(t.FineX, t.FineZ),
-    TaskKind.BuildCampfire => map.Campfires.Any(f => f.TileX == t.TileX && f.TileZ == t.TileZ),
-    TaskKind.DemolishCampfire => !map.Campfires.Any(f => f.TileX == t.TileX && f.TileZ == t.TileZ),
-    TaskKind.BuildSpring => map.Springs.Any(s => s.TileX == t.TileX && s.TileZ == t.TileZ),
-    TaskKind.DemolishSpring => !map.Springs.Any(s => s.TileX == t.TileX && s.TileZ == t.TileZ),
-    TaskKind.BuildLightPost => map.LightPosts.Any(l => l.TileX == t.TileX && l.TileZ == t.TileZ),
-    TaskKind.DemolishLightPost => !map.LightPosts.Any(l => l.TileX == t.TileX && l.TileZ == t.TileZ),
+    TaskKind.BuildCampfire => map.Campfires.Any(f => f.AnchorFx == t.FineX && f.AnchorFz == t.FineZ),
+    TaskKind.DemolishCampfire => !map.Campfires.Any(f => f.AnchorFx == t.FineX && f.AnchorFz == t.FineZ),
+    TaskKind.BuildSpring => map.Springs.Any(s => s.AnchorFx == t.FineX && s.AnchorFz == t.FineZ),
+    TaskKind.DemolishSpring => !map.Springs.Any(s => s.AnchorFx == t.FineX && s.AnchorFz == t.FineZ),
+    TaskKind.BuildLightPost => map.LightPosts.Any(l => l.AnchorFx == t.FineX && l.AnchorFz == t.FineZ),
+    TaskKind.DemolishLightPost => !map.LightPosts.Any(l => l.AnchorFx == t.FineX && l.AnchorFz == t.FineZ),
     _ => false,
   };
 
@@ -61,11 +61,11 @@ public class WorkQueue
     {
       TaskKind.Dig => map.CanDigVoxel(t.FineX, t.FineZ),
       TaskKind.Deposit => map.CanDepositVoxel(t.FineX, t.FineZ) && globalInventory.Has("Dirt", 1),
-      TaskKind.BuildCampfire => map.CanPlaceCampfire(t.TileX, t.TileZ),
+      TaskKind.BuildCampfire => map.CanPlaceCampfire(t.FineX, t.FineZ),
       TaskKind.DemolishCampfire => true,
-      TaskKind.BuildSpring => map.CanPlaceSpring(t.TileX, t.TileZ),
+      TaskKind.BuildSpring => map.CanPlaceSpring(t.FineX, t.FineZ),
       TaskKind.DemolishSpring => true,
-      TaskKind.BuildLightPost => map.CanPlaceLightPost(t.TileX, t.TileZ),
+      TaskKind.BuildLightPost => map.CanPlaceLightPost(t.FineX, t.FineZ),
       TaskKind.DemolishLightPost => true,
       _ => false,
     };

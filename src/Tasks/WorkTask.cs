@@ -1,5 +1,4 @@
 using ColonySim.Entities;
-using ColonySim.World;
 
 namespace ColonySim.Tasks;
 
@@ -10,22 +9,19 @@ public class WorkTask
 {
   public TaskKind Kind { get; }
 
-  // The coarse tile the action happens in — for Dig/Deposit this is just
-  // the tile containing FineX/FineZ (a builder can dig/deposit any fine
-  // column from anywhere on its parent tile, same as the old whole-tile
-  // Dig always could); for the campfire kinds it's the fire's own tile.
-  public int TileX { get; }
-  public int TileZ { get; }
-
-  // Where the worker has to be standing to perform the work — same as
-  // TileX/TileZ for every kind except DemolishCampfire, whose target tile
-  // is itself unwalkable (the fire is standing on it).
-  public int StandX { get; }
-  public int StandZ { get; }
-
-  // The exact fine voxel column targeted — meaningful only for Dig/Deposit.
+  // The fine voxel this task targets — the exact voxel for Dig/Deposit, or
+  // the footprint anchor for a Campfire/Spring/LightPost build/demolish.
   public int FineX { get; }
   public int FineZ { get; }
+
+  // The fine voxel a worker has to be standing on to perform the work.
+  // Equal to FineX/FineZ for Dig/Deposit and for any build/demolish whose
+  // target doesn't block its own footprint (Spring always; LightPost/
+  // Campfire while building, since nothing's placed yet to block); resolved
+  // to a nearby free voxel instead when the target already blocks its own
+  // footprint (DemolishCampfire, DemolishLightPost).
+  public int StandX { get; }
+  public int StandZ { get; }
 
   // How long, in seconds of continuous work, this task takes once a worker
   // has arrived. Computed once by the caller at construction time.
@@ -42,46 +38,27 @@ public class WorkTask
   public Actor? Worker { get; set; }
   public bool Complete { get; set; }
 
-  WorkTask(TaskKind kind, int tileX, int tileZ, int standX, int standZ, int fineX, int fineZ, float duration)
+  public WorkTask(TaskKind kind, int fineX, int fineZ, int standX, int standZ, float duration)
   {
     Kind = kind;
-    TileX = tileX;
-    TileZ = tileZ;
-    StandX = standX;
-    StandZ = standZ;
     FineX = fineX;
     FineZ = fineZ;
+    StandX = standX;
+    StandZ = standZ;
     Duration = duration;
   }
-
-  // Dig/Deposit: targets one exact fine voxel column. The containing
-  // coarse tile doubles as the stand tile — a builder can work any of its
-  // 100 fine columns from anywhere on it.
-  public static WorkTask ForVoxel(TaskKind kind, int fineX, int fineZ, float duration)
-  {
-    int tileX = fineX / TileMap.FineSubdivisions;
-    int tileZ = fineZ / TileMap.FineSubdivisions;
-    return new WorkTask(kind, tileX, tileZ, tileX, tileZ, fineX, fineZ, duration);
-  }
-
-  // The whole-tile kinds (the campfire and spring pairs): FineX/FineZ are
-  // unused. standX/standZ is usually the same tile, but can be an adjacent
-  // one for demolition work whose target tile blocks itself (a campfire
-  // stands on its own tile).
-  public static WorkTask ForTile(TaskKind kind, int tileX, int tileZ, int standX, int standZ, float duration) =>
-    new(kind, tileX, tileZ, standX, standZ, fineX: 0, fineZ: 0, duration);
 
   // Human-readable label for the task queue panel.
   public string Label => Kind switch
   {
     TaskKind.Dig => $"Dig voxel ({FineX},{FineZ})",
     TaskKind.Deposit => $"Deposit voxel ({FineX},{FineZ})",
-    TaskKind.BuildCampfire => $"Build campfire ({TileX},{TileZ})",
-    TaskKind.DemolishCampfire => $"Demolish campfire ({TileX},{TileZ})",
-    TaskKind.BuildSpring => $"Dig spring ({TileX},{TileZ})",
-    TaskKind.DemolishSpring => $"Cap spring ({TileX},{TileZ})",
-    TaskKind.BuildLightPost => $"Build light post ({TileX},{TileZ})",
-    TaskKind.DemolishLightPost => $"Remove light post ({TileX},{TileZ})",
+    TaskKind.BuildCampfire => $"Build campfire ({FineX},{FineZ})",
+    TaskKind.DemolishCampfire => $"Demolish campfire ({FineX},{FineZ})",
+    TaskKind.BuildSpring => $"Dig spring ({FineX},{FineZ})",
+    TaskKind.DemolishSpring => $"Cap spring ({FineX},{FineZ})",
+    TaskKind.BuildLightPost => $"Build light post ({FineX},{FineZ})",
+    TaskKind.DemolishLightPost => $"Remove light post ({FineX},{FineZ})",
     _ => Kind.ToString(),
   };
 }

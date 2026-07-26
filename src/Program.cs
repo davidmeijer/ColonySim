@@ -50,9 +50,17 @@ public static class Program
         {
             var map = new TileMap(WorldWidth, WorldDepth, seed);
 
+            // WalkableTiles scatters across the coarse grid (cheap, and good
+            // enough for "roughly spread out starting spots") — each chosen
+            // tile becomes its centre fine voxel, since an actor's actual
+            // position is fine-grained from here on.
             var spawnRng = new Random(99);
             var spawnTiles = map.WalkableTiles().OrderBy(_ => spawnRng.Next()).Take(ActorCount).ToList();
-            var actors = spawnTiles.Select(t => new Actor(map, t.X, t.Y)).ToList();
+            var actors = spawnTiles.Select(t =>
+            {
+                var (fx, fz) = map.FineCenter(t.X, t.Y);
+                return new Actor(map, fx, fz);
+            }).ToList();
 
             var sun = new SunLight();
             map.SetTerrainShader(sun.Shader);
@@ -550,7 +558,7 @@ public static class Program
         {
             if (!actor.Stuck || actor.FinalDestination is not { } dest) continue;
 
-            var path = AStar.FindPath(map, actor.TileX, actor.TileZ, dest.X, dest.Y);
+            var path = AStar.FindPath(map, actor.FineX, actor.FineZ, dest.X, dest.Y, Actor.FootprintSize, Actor.HeightVoxels);
             actor.Reroute(path);
         }
     }
@@ -592,7 +600,7 @@ public static class Program
                 continue;
             }
 
-            bool arrived = !actor.IsMoving && actor.TileX == task.StandX && actor.TileZ == task.StandZ;
+            bool arrived = !actor.IsMoving && actor.FineX == task.StandX && actor.FineZ == task.StandZ;
             if (!arrived) continue;
 
             if (!task.Started)
@@ -642,7 +650,7 @@ public static class Program
         {
             if (takenStandTiles.Contains((candidate.StandX, candidate.StandZ))) continue;
 
-            var path = AStar.FindPath(map, actor.TileX, actor.TileZ, candidate.StandX, candidate.StandZ);
+            var path = AStar.FindPath(map, actor.FineX, actor.FineZ, candidate.StandX, candidate.StandZ, Actor.FootprintSize, Actor.HeightVoxels);
             if (path.Count == 0) continue;
 
             candidate.Worker = actor;
@@ -668,12 +676,12 @@ public static class Program
     {
         TaskKind.Dig => CompleteDig(task, map, globalInventory),
         TaskKind.Deposit => CompleteDeposit(task, map, globalInventory),
-        TaskKind.BuildCampfire => map.PlaceCampfire(task.TileX, task.TileZ) != null,
-        TaskKind.DemolishCampfire => map.RemoveCampfire(task.TileX, task.TileZ),
-        TaskKind.BuildSpring => map.PlaceSpring(task.TileX, task.TileZ) != null,
-        TaskKind.DemolishSpring => map.RemoveSpring(task.TileX, task.TileZ),
-        TaskKind.BuildLightPost => map.PlaceLightPost(task.TileX, task.TileZ) != null,
-        TaskKind.DemolishLightPost => map.RemoveLightPost(task.TileX, task.TileZ),
+        TaskKind.BuildCampfire => map.PlaceCampfire(task.FineX, task.FineZ) != null,
+        TaskKind.DemolishCampfire => map.RemoveCampfire(task.FineX, task.FineZ),
+        TaskKind.BuildSpring => map.PlaceSpring(task.FineX, task.FineZ) != null,
+        TaskKind.DemolishSpring => map.RemoveSpring(task.FineX, task.FineZ),
+        TaskKind.BuildLightPost => map.PlaceLightPost(task.FineX, task.FineZ) != null,
+        TaskKind.DemolishLightPost => map.RemoveLightPost(task.FineX, task.FineZ),
         _ => true,
     };
 
@@ -719,11 +727,12 @@ public static class Program
         return Raylib.CheckCollisionPointRec(mouse, TaskQueuePanelRect(workQueue.Tasks.Count));
     }
 
-    // How far (in coarse tiles) an idle actor might wander off to, and how
-    // many random spots it'll try before giving up for this attempt (see
-    // Actor.DeferWander) — small numbers on purpose, so this reads as
-    // ambling near where it already is, not a cross-map errand.
-    const int WanderRadius = 4;
+    // How far (in fine voxels — roughly 4 old coarse tiles' worth) an idle
+    // actor might wander off to, and how many random spots it'll try before
+    // giving up for this attempt (see Actor.DeferWander) — small numbers on
+    // purpose, so this reads as ambling near where it already is, not a
+    // cross-map errand.
+    const int WanderRadiusVoxels = 4 * TileMap.FineSubdivisions;
     const int WanderAttempts = 6;
 
     // Actors with nothing else going on amble a few tiles in a random
@@ -748,31 +757,31 @@ public static class Program
             if (!actor.WantsToWander) continue;
             if (workQueue.Tasks.Any(t => t.Worker == actor)) continue;
 
-            if (PickWanderTile(map, actor.TileX, actor.TileZ) is not { } target)
+            if (PickWanderVoxel(map, actor.FineX, actor.FineZ) is not { } target)
             {
                 actor.DeferWander();
                 continue;
             }
 
-            var path = AStar.FindPath(map, actor.TileX, actor.TileZ, target.X, target.Z);
+            var path = AStar.FindPath(map, actor.FineX, actor.FineZ, target.X, target.Z, Actor.FootprintSize, Actor.HeightVoxels);
             actor.SetPath(path);
         }
     }
 
-    // A handful of random tries within WanderRadius tiles, returning the
-    // first one that's actually walkable — good enough on a mostly-open
-    // map (the common case), and cheap to just give up on for a spot boxed
-    // in tight rather than searching harder for one.
-    static (int X, int Z)? PickWanderTile(TileMap map, int cx, int cz)
+    // A handful of random tries within WanderRadiusVoxels, returning the
+    // first one the actor could actually occupy — good enough on a
+    // mostly-open map (the common case), and cheap to just give up on for a
+    // spot boxed in tight rather than searching harder for one.
+    static (int X, int Z)? PickWanderVoxel(TileMap map, int cfx, int cfz)
     {
         for (int i = 0; i < WanderAttempts; i++)
         {
-            int dx = Random.Shared.Next(-WanderRadius, WanderRadius + 1);
-            int dz = Random.Shared.Next(-WanderRadius, WanderRadius + 1);
+            int dx = Random.Shared.Next(-WanderRadiusVoxels, WanderRadiusVoxels + 1);
+            int dz = Random.Shared.Next(-WanderRadiusVoxels, WanderRadiusVoxels + 1);
             if (dx == 0 && dz == 0) continue;
 
-            int x = cx + dx, z = cz + dz;
-            if (map.IsWalkable(x, z)) return (x, z);
+            int fx = cfx + dx, fz = cfz + dz;
+            if (map.CanOccupy(fx, fz, Actor.FootprintSize, Actor.HeightVoxels)) return (fx, fz);
         }
         return null;
     }
@@ -976,17 +985,17 @@ public static class Program
         if (Raylib.IsMouseButtonReleased(MouseButton.Right))
         {
             if (!selection.RightDragged && selection.Selected.Count > 0 &&
-                TryPickTile(map, camera, Raylib.GetMousePosition(), out int hitX, out int hitZ) &&
-                map.IsWalkable(hitX, hitZ))
+                TryPickVoxel(map, camera, Raylib.GetMousePosition(), out int hitFx, out int hitFz) &&
+                map.CanOccupy(hitFx, hitFz, Actor.FootprintSize, Actor.HeightVoxels))
             {
                 // A direct order always overrides whatever an actor was
                 // doing before, including a give-up — SetPath (not
                 // Reroute) resets its stuck budget for the new attempt.
                 var movers = selection.Selected.ToList();
-                var destinations = AssignDestinations(map, movers, hitX, hitZ);
+                var destinations = AssignDestinations(map, movers, hitFx, hitFz);
                 foreach (var (actor, dest) in destinations)
                 {
-                    var path = AStar.FindPath(map, actor.TileX, actor.TileZ, dest.X, dest.Z);
+                    var path = AStar.FindPath(map, actor.FineX, actor.FineZ, dest.X, dest.Z, Actor.FootprintSize, Actor.HeightVoxels);
 
                     // A manual order always wins over whatever work-queue
                     // assignment this actor was mid-way through — release it
@@ -1003,9 +1012,11 @@ public static class Program
     }
 
     // Ray-casts from a screen position through every coarse tile's column
-    // bounds and returns the nearest hit point — the shared "what point on
-    // the ground is the mouse over" query both TryPickTile (coarse) and
-    // TryPickVoxel (fine) derive their own result from.
+    // bounds (iterating coarse tiles here is just a cheap way to cull the
+    // raycast — the returned hit point itself is full precision, so
+    // TryPickVoxel's fine-voxel conversion below isn't limited by it) and
+    // returns the nearest hit point — the "what point on the ground is the
+    // mouse over" query TryPickVoxel derives its own result from.
     static bool TryPickGround(TileMap map, Camera3D camera, Vector2 screenPos, out Vector3 hitPoint)
     {
         Ray ray = Raylib.GetScreenToWorldRay(screenPos, camera);
@@ -1030,23 +1041,10 @@ public static class Program
         return hitAny;
     }
 
-    // Which coarse tile the mouse is over — used by move orders and
-    // campfire placement.
-    static bool TryPickTile(TileMap map, Camera3D camera, Vector2 screenPos, out int tileX, out int tileZ)
-    {
-        if (!TryPickGround(map, camera, screenPos, out Vector3 hitPoint))
-        {
-            tileX = tileZ = -1;
-            return false;
-        }
-
-        tileX = Math.Clamp((int)MathF.Floor(hitPoint.X / TileMap.TileSize), 0, map.Width - 1);
-        tileZ = Math.Clamp((int)MathF.Floor(hitPoint.Z / TileMap.TileSize), 0, map.Depth - 1);
-        return true;
-    }
-
-    // Which exact fine voxel column the mouse is over — the finer-grained
-    // pick Dig/Deposit's per-voxel selection needs.
+    // Which exact fine voxel column the mouse is over — every placement
+    // tool (Dig/Deposit, and now Campfire/Spring/LightPost too, since
+    // footprints are fine-voxel-anchored) and every move order picks
+    // through this; there's no coarser "which tile" picker any more.
     static bool TryPickVoxel(TileMap map, Camera3D camera, Vector2 screenPos, out int fineX, out int fineZ)
     {
         if (!TryPickGround(map, camera, screenPos, out Vector3 hitPoint))
@@ -1151,12 +1149,12 @@ public static class Program
     }
 
     // Applies the coarse-tile tools (the campfire and spring pairs) to the
-    // tile under the mouse — queuing a WorkTask on success, doing nothing
-    // on an invalid tile. Disarms afterward only for the two build tools;
-    // the demolish tools stay armed for repeated stamping.
+    // footprint under the mouse — queuing a WorkTask on success, doing
+    // nothing on an invalid spot. Disarms afterward only for the build
+    // tools; the demolish tools stay armed for repeated stamping.
     static void TryPlaceArmedTool(TileMap map, WorkQueue workQueue, BuildMenuState menu, Camera3D camera)
     {
-        if (!TryPickTile(map, camera, Raylib.GetMousePosition(), out int tx, out int tz))
+        if (!TryPickVoxel(map, camera, Raylib.GetMousePosition(), out int fx, out int fz))
         {
             if (menu.ArmedTool is ToolKind.Campfire or ToolKind.Spring or ToolKind.LightPost) menu.ArmedTool = ToolKind.None;
             return;
@@ -1165,43 +1163,46 @@ public static class Program
         switch (menu.ArmedTool)
         {
             case ToolKind.Campfire:
-                if (map.CanPlaceCampfire(tx, tz))
-                    workQueue.Enqueue(WorkTask.ForTile(TaskKind.BuildCampfire, tx, tz, tx, tz, BuildCampfireDuration));
+                if (map.CanPlaceCampfire(fx, fz))
+                    workQueue.Enqueue(new WorkTask(TaskKind.BuildCampfire, fx, fz, fx, fz, BuildCampfireDuration));
                 menu.ArmedTool = ToolKind.None;
                 break;
 
             case ToolKind.DemolishCampfire:
-                if (map.Campfires.Any(f => f.TileX == tx && f.TileZ == tz) &&
-                    NearestWalkableNeighbor(map, tx, tz) is { } stand)
+                if (map.Campfires.FirstOrDefault(f => TileMap.FootprintContains(f.AnchorFx, f.AnchorFz, Campfire.Footprint, fx, fz)) is { } fire &&
+                    NearestWalkableNeighborOfFootprint(map, fire.AnchorFx, fire.AnchorFz, Campfire.Footprint) is { } fireStand)
                 {
-                    workQueue.Enqueue(WorkTask.ForTile(TaskKind.DemolishCampfire, tx, tz, stand.X, stand.Z, DemolishCampfireDuration));
+                    workQueue.Enqueue(new WorkTask(TaskKind.DemolishCampfire, fire.AnchorFx, fire.AnchorFz, fireStand.Fx, fireStand.Fz, DemolishCampfireDuration));
                 }
                 break;
 
-            // Unlike a campfire, a spring doesn't block its own tile, so
-            // the worker stands right on it for both building and capping.
+            // A spring never blocks its own footprint, so the worker stands
+            // right on its anchor for both building and capping.
             case ToolKind.Spring:
-                if (map.CanPlaceSpring(tx, tz))
-                    workQueue.Enqueue(WorkTask.ForTile(TaskKind.BuildSpring, tx, tz, tx, tz, BuildSpringDuration));
+                if (map.CanPlaceSpring(fx, fz))
+                    workQueue.Enqueue(new WorkTask(TaskKind.BuildSpring, fx, fz, fx, fz, BuildSpringDuration));
                 menu.ArmedTool = ToolKind.None;
                 break;
 
             case ToolKind.DemolishSpring:
-                if (map.Springs.Any(s => s.TileX == tx && s.TileZ == tz))
-                    workQueue.Enqueue(WorkTask.ForTile(TaskKind.DemolishSpring, tx, tz, tx, tz, DemolishSpringDuration));
+                if (map.Springs.FirstOrDefault(s => TileMap.FootprintContains(s.AnchorFx, s.AnchorFz, Spring.Footprint, fx, fz)) is { } spring)
+                    workQueue.Enqueue(new WorkTask(TaskKind.DemolishSpring, spring.AnchorFx, spring.AnchorFz, spring.AnchorFx, spring.AnchorFz, DemolishSpringDuration));
                 break;
 
-            // A light post doesn't block its own tile either, so the worker
-            // stands right on it, same as a spring.
+            // A fresh light post isn't placed yet, so nothing blocks its own
+            // anchor — the worker stands right on it, same as a spring.
             case ToolKind.LightPost:
-                if (map.CanPlaceLightPost(tx, tz))
-                    workQueue.Enqueue(WorkTask.ForTile(TaskKind.BuildLightPost, tx, tz, tx, tz, BuildLightPostDuration));
+                if (map.CanPlaceLightPost(fx, fz))
+                    workQueue.Enqueue(new WorkTask(TaskKind.BuildLightPost, fx, fz, fx, fz, BuildLightPostDuration));
                 menu.ArmedTool = ToolKind.None;
                 break;
 
             case ToolKind.DemolishLightPost:
-                if (map.LightPosts.Any(l => l.TileX == tx && l.TileZ == tz))
-                    workQueue.Enqueue(WorkTask.ForTile(TaskKind.DemolishLightPost, tx, tz, tx, tz, DemolishLightPostDuration));
+                if (map.LightPosts.FirstOrDefault(l => TileMap.FootprintContains(l.AnchorFx, l.AnchorFz, LightPost.Footprint, fx, fz)) is { } post &&
+                    NearestWalkableNeighborOfFootprint(map, post.AnchorFx, post.AnchorFz, LightPost.Footprint) is { } postStand)
+                {
+                    workQueue.Enqueue(new WorkTask(TaskKind.DemolishLightPost, post.AnchorFx, post.AnchorFz, postStand.Fx, postStand.Fz, DemolishLightPostDuration));
+                }
                 break;
         }
     }
@@ -1270,55 +1271,67 @@ public static class Program
         if (!valid || workQueue.HasPendingVoxelTask(kind, fineX, fineZ)) return;
 
         float duration = kind == TaskKind.Dig ? DigVoxelDuration : DepositVoxelDuration;
-        workQueue.Enqueue(WorkTask.ForVoxel(kind, fineX, fineZ, duration));
+        // The builder stands right on the voxel it's digging/depositing —
+        // no separate "anywhere on the parent tile" allowance any more now
+        // that arrival is checked in exact fine-voxel terms.
+        workQueue.Enqueue(new WorkTask(kind, fineX, fineZ, fineX, fineZ, duration));
     }
 
-    // The nearest walkable orthogonal neighbour of a tile that's itself
-    // unwalkable (a campfire) — where a DemolishCampfire task's worker has
-    // to stand, since it can't stand on the fire itself. Null in the (rare)
-    // case all four sides are blocked too.
-    static (int X, int Z)? NearestWalkableNeighbor(TileMap map, int x, int z)
+    // The nearest fine voxel a builder can actually stand on, just outside
+    // a footprint of voxels that's blocked (or about to be) — where a
+    // DemolishCampfire/DemolishLightPost task's worker has to stand, since
+    // it can't stand inside the footprint it's demolishing. Walks the ring
+    // of voxels immediately surrounding the footprint's bounding box, one
+    // side at a time. Null in the (rare) case the whole ring is blocked too.
+    static (int Fx, int Fz)? NearestWalkableNeighborOfFootprint(TileMap map, int anchorFx, int anchorFz, int footprintSize)
     {
-        foreach (var (dx, dz) in new[] { (1, 0), (-1, 0), (0, 1), (0, -1) })
+        var (minFx, minFz, maxFx, maxFz) = TileMap.FootprintBounds(anchorFx, anchorFz, footprintSize);
+
+        for (int fx = minFx; fx <= maxFx; fx++)
         {
-            int nx = x + dx, nz = z + dz;
-            if (map.IsWalkable(nx, nz)) return (nx, nz);
+            if (map.CanOccupy(fx, minFz - 1, Actor.FootprintSize, Actor.HeightVoxels)) return (fx, minFz - 1);
+            if (map.CanOccupy(fx, maxFz + 1, Actor.FootprintSize, Actor.HeightVoxels)) return (fx, maxFz + 1);
+        }
+        for (int fz = minFz; fz <= maxFz; fz++)
+        {
+            if (map.CanOccupy(minFx - 1, fz, Actor.FootprintSize, Actor.HeightVoxels)) return (minFx - 1, fz);
+            if (map.CanOccupy(maxFx + 1, fz, Actor.FootprintSize, Actor.HeightVoxels)) return (maxFx + 1, fz);
         }
         return null;
     }
 
-    // Gives each mover its own nearby walkable tile around the target, so a
-    // group order doesn't send everyone to stack on the exact same spot.
-    // Closer actors claim the closer slots first. Actors no longer block
-    // each other's paths or destinations (see ResolveOverlaps for how a
-    // crowd still avoids fully overlapping) — "claimed" here is only about
-    // this one order not sending two of its own movers to the same tile,
-    // not about staying off tiles other actors happen to occupy.
+    // Gives each mover its own nearby occupiable voxel around the target,
+    // so a group order doesn't send everyone to stack on the exact same
+    // spot. Closer actors claim the closer slots first. Actors no longer
+    // block each other's paths or destinations (see ResolveOverlaps for how
+    // a crowd still avoids fully overlapping) — "claimed" here is only
+    // about this one order not sending two of its own movers to the same
+    // voxel, not about staying off voxels other actors happen to occupy.
     static Dictionary<Actor, (int X, int Z)> AssignDestinations(
-        TileMap map, List<Actor> movers, int targetX, int targetZ)
+        TileMap map, List<Actor> movers, int targetFx, int targetFz)
     {
         var claimed = new HashSet<(int, int)>();
         var result = new Dictionary<Actor, (int, int)>();
 
-        foreach (var actor in movers.OrderBy(p => Math.Abs(p.TileX - targetX) + Math.Abs(p.TileZ - targetZ)))
+        foreach (var actor in movers.OrderBy(p => Math.Abs(p.FineX - targetFx) + Math.Abs(p.FineZ - targetFz)))
         {
-            var tile = FindNearestFreeTile(map, targetX, targetZ, claimed);
-            if (tile is { } t)
+            var voxel = FindNearestFreeVoxel(map, targetFx, targetFz, claimed);
+            if (voxel is { } v)
             {
-                claimed.Add(t);
-                result[actor] = t;
+                claimed.Add(v);
+                result[actor] = v;
             }
         }
         return result;
     }
 
-    // Spirals outward ring by ring from (cx, cz) until it finds a walkable
-    // tile nobody else in this order has claimed.
-    static (int X, int Z)? FindNearestFreeTile(TileMap map, int cx, int cz, HashSet<(int, int)> claimed)
+    // Spirals outward ring by ring from (cfx, cfz) until it finds a voxel
+    // the actor could occupy that nobody else in this order has claimed.
+    static (int X, int Z)? FindNearestFreeVoxel(TileMap map, int cfx, int cfz, HashSet<(int, int)> claimed)
     {
-        if (map.IsWalkable(cx, cz) && !claimed.Contains((cx, cz))) return (cx, cz);
+        if (map.CanOccupy(cfx, cfz, Actor.FootprintSize, Actor.HeightVoxels) && !claimed.Contains((cfx, cfz))) return (cfx, cfz);
 
-        int maxRadius = Math.Max(map.Width, map.Depth);
+        int maxRadius = Math.Max(map.Width, map.Depth) * TileMap.FineSubdivisions;
         for (int radius = 1; radius <= maxRadius; radius++)
         {
             for (int dx = -radius; dx <= radius; dx++)
@@ -1326,14 +1339,14 @@ public static class Program
                 for (int dz = -radius; dz <= radius; dz++)
                 {
                     if (Math.Max(Math.Abs(dx), Math.Abs(dz)) != radius) continue; // only this ring's edge
-                    int x = cx + dx, z = cz + dz;
-                    if (!map.IsWalkable(x, z)) continue;
-                    if (claimed.Contains((x, z))) continue;
-                    return (x, z);
+                    int fx = cfx + dx, fz = cfz + dz;
+                    if (!map.CanOccupy(fx, fz, Actor.FootprintSize, Actor.HeightVoxels)) continue;
+                    if (claimed.Contains((fx, fz))) continue;
+                    return (fx, fz);
                 }
             }
         }
-        return null; // no free tile anywhere — shouldn't happen in practice
+        return null; // no free voxel anywhere — shouldn't happen in practice
     }
 
     static void Draw(GameSession session, TileMap map, List<Actor> actors, SelectionState selection, SettingsMenuState settingsMenu,
@@ -1411,28 +1424,57 @@ public static class Program
         foreach (var task in workQueue.Tasks.Where(t => t.Kind is TaskKind.Dig or TaskKind.Deposit && !t.Complete))
             DrawVoxelMarker(map, task.FineX, task.FineZ, task.Kind == TaskKind.Deposit, Color.SkyBlue, wireOnly: true);
 
-        // A ghost preview on whichever tile/voxel the mouse is over while a
+        // A ghost preview of the actual footprint the mouse is over while a
         // tool is armed: orange for Campfire (matching its previous
         // colour), blue-ish for Dig/Deposit, red whenever the hovered spot
-        // isn't a legal target — so the player knows before clicking.
+        // isn't a legal target — so the player knows before clicking. For a
+        // build tool the footprint is anchored on the hovered voxel (that's
+        // where it would land); for a demolish tool it's anchored on
+        // whichever existing building's footprint the hover voxel actually
+        // falls inside, so the outline shows the real thing about to be
+        // removed, not a footprint centred wherever happened to be clicked.
         if (buildMenu.ArmedTool is ToolKind.Campfire or ToolKind.DemolishCampfire or ToolKind.Spring or ToolKind.DemolishSpring
                 or ToolKind.LightPost or ToolKind.DemolishLightPost &&
-            TryPickTile(map, camera, Raylib.GetMousePosition(), out int hoverX, out int hoverZ))
+            TryPickVoxel(map, camera, Raylib.GetMousePosition(), out int hoverFx, out int hoverFz))
         {
-            bool valid = buildMenu.ArmedTool switch
+            int footprintSize = buildMenu.ArmedTool switch
             {
-                ToolKind.Campfire => map.CanPlaceCampfire(hoverX, hoverZ),
-                ToolKind.Spring => map.CanPlaceSpring(hoverX, hoverZ),
-                ToolKind.DemolishSpring => map.Springs.Any(s => s.TileX == hoverX && s.TileZ == hoverZ),
-                ToolKind.LightPost => map.CanPlaceLightPost(hoverX, hoverZ),
-                ToolKind.DemolishLightPost => map.LightPosts.Any(l => l.TileX == hoverX && l.TileZ == hoverZ),
-                _ => map.Campfires.Any(f => f.TileX == hoverX && f.TileZ == hoverZ),
+                ToolKind.Campfire or ToolKind.DemolishCampfire => Campfire.Footprint,
+                ToolKind.Spring or ToolKind.DemolishSpring => Spring.Footprint,
+                _ => LightPost.Footprint,
             };
+
+            bool valid;
+            int anchorFx = hoverFx, anchorFz = hoverFz;
+            switch (buildMenu.ArmedTool)
+            {
+                case ToolKind.Campfire:
+                    valid = map.CanPlaceCampfire(hoverFx, hoverFz);
+                    break;
+                case ToolKind.Spring:
+                    valid = map.CanPlaceSpring(hoverFx, hoverFz);
+                    break;
+                case ToolKind.LightPost:
+                    valid = map.CanPlaceLightPost(hoverFx, hoverFz);
+                    break;
+                case ToolKind.DemolishCampfire:
+                    (valid, anchorFx, anchorFz) = FindHoveredFootprint(
+                        map.Campfires.Select(f => (f.AnchorFx, f.AnchorFz)), footprintSize, hoverFx, hoverFz);
+                    break;
+                case ToolKind.DemolishSpring:
+                    (valid, anchorFx, anchorFz) = FindHoveredFootprint(
+                        map.Springs.Select(s => (s.AnchorFx, s.AnchorFz)), footprintSize, hoverFx, hoverFz);
+                    break;
+                default: // DemolishLightPost
+                    (valid, anchorFx, anchorFz) = FindHoveredFootprint(
+                        map.LightPosts.Select(l => (l.AnchorFx, l.AnchorFz)), footprintSize, hoverFx, hoverFz);
+                    break;
+            }
 
             // Springs preview blue rather than the campfire's orange — they're
             // the one build tool whose whole point is water; light posts get
             // their own pale cyan, close to the actual glow colour they cast.
-            Color ringColor = !valid
+            Color outlineColor = !valid
                 ? new Color(220, 60, 60, 220)
                 : buildMenu.ArmedTool switch
                 {
@@ -1441,11 +1483,7 @@ public static class Program
                     _ => new Color(255, 170, 60, 220),
                 };
 
-            Vector3 ringCenter = new(
-                hoverX * TileMap.TileSize + TileMap.TileSize / 2f,
-                map.SurfaceY(hoverX, hoverZ) + 2f,
-                hoverZ * TileMap.TileSize + TileMap.TileSize / 2f);
-            Raylib.DrawCircle3D(ringCenter, TileMap.TileSize * 0.45f, new Vector3(1f, 0f, 0f), 90f, ringColor);
+            DrawFootprintOutline(map, anchorFx, anchorFz, footprintSize, outlineColor);
         }
         else if (buildMenu.ArmedTool is ToolKind.Dig or ToolKind.Deposit)
         {
@@ -1470,15 +1508,12 @@ public static class Program
         // voxel) into screen space.
         foreach (var task in workQueue.Tasks.Where(t => t.Started && !t.Complete))
         {
-            Vector3 worldPos = task.Kind is TaskKind.Dig or TaskKind.Deposit
-                ? new Vector3(
-                    task.FineX * TileMap.VoxelSize + TileMap.VoxelSize / 2f,
-                    map.VoxelHeightAt(task.FineX, task.FineZ) * TileMap.VoxelSize + TileMap.TileSize * 0.3f,
-                    task.FineZ * TileMap.VoxelSize + TileMap.VoxelSize / 2f)
-                : new Vector3(
-                    task.TileX * TileMap.TileSize + TileMap.TileSize / 2f,
-                    map.SurfaceY(task.TileX, task.TileZ) + TileMap.TileSize * 0.9f,
-                    task.TileZ * TileMap.TileSize + TileMap.TileSize / 2f);
+            // Every task kind targets a fine voxel now, so this no longer
+            // needs to branch on Dig/Deposit vs. everything else.
+            Vector3 worldPos = new(
+                task.FineX * TileMap.VoxelSize + TileMap.VoxelSize / 2f,
+                map.VoxelHeightAt(task.FineX, task.FineZ) * TileMap.VoxelSize + TileMap.TileSize * 0.3f,
+                task.FineZ * TileMap.VoxelSize + TileMap.VoxelSize / 2f);
             Vector2 screenPos = Raylib.GetWorldToScreen(worldPos, camera);
 
             const float barWidth = 40f, barHeight = 6f;
@@ -1517,6 +1552,40 @@ public static class Program
         Raylib.DrawFPS(10, ScreenHeight - 30);
 
         Raylib.EndDrawing();
+    }
+
+    // Finds the first (anchorFx, anchorFz) among candidates whose footprint
+    // contains the hovered voxel — used by the demolish tools' hover
+    // preview to highlight the actual existing building under the cursor,
+    // not a fresh footprint centred wherever within it happened to be
+    // clicked. Returns (false, hoverFx, hoverFz) when nothing's there.
+    static (bool Found, int AnchorFx, int AnchorFz) FindHoveredFootprint(
+        IEnumerable<(int AnchorFx, int AnchorFz)> candidates, int footprintSize, int hoverFx, int hoverFz)
+    {
+        foreach (var (anchorFx, anchorFz) in candidates)
+            if (TileMap.FootprintContains(anchorFx, anchorFz, footprintSize, hoverFx, hoverFz))
+                return (true, anchorFx, anchorFz);
+        return (false, hoverFx, hoverFz);
+    }
+
+    // A flat square outline showing exactly where a size x size footprint
+    // (in fine voxels) centred on (anchorFx, anchorFz) actually sits —
+    // the real placement/removal preview, sized to match, rather than a
+    // fixed-size ring that didn't reflect how big the thing actually is.
+    static void DrawFootprintOutline(TileMap map, int anchorFx, int anchorFz, int footprintSize, Color color)
+    {
+        var (minFx, minFz, maxFx, maxFz) = TileMap.FootprintBounds(anchorFx, anchorFz, footprintSize);
+        float x0 = minFx * TileMap.VoxelSize, x1 = (maxFx + 1) * TileMap.VoxelSize;
+        float z0 = minFz * TileMap.VoxelSize, z1 = (maxFz + 1) * TileMap.VoxelSize;
+
+        float worldX = anchorFx * TileMap.VoxelSize + TileMap.VoxelSize / 2f;
+        float worldZ = anchorFz * TileMap.VoxelSize + TileMap.VoxelSize / 2f;
+        float y = map.SmoothSurfaceY(worldX, worldZ) + 2f;
+
+        Raylib.DrawLine3D(new Vector3(x0, y, z0), new Vector3(x1, y, z0), color);
+        Raylib.DrawLine3D(new Vector3(x1, y, z0), new Vector3(x1, y, z1), color);
+        Raylib.DrawLine3D(new Vector3(x1, y, z1), new Vector3(x0, y, z1), color);
+        Raylib.DrawLine3D(new Vector3(x0, y, z1), new Vector3(x0, y, z0), color);
     }
 
     // Where a Dig/Deposit ghost/marker box for one fine voxel should sit:

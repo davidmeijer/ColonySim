@@ -6,16 +6,22 @@ namespace ColonySim.World;
 // decides where water can go, a spring decides where it comes from — and
 // the two together are what make channel-building a thing you can actually
 // do rather than just watch. Position isn't cached here; like Tree, Bush
-// and Campfire, world position is recomputed from TileX/TileZ against the
-// live terrain height wherever it's needed.
+// and Campfire, world position is recomputed from AnchorFx/AnchorFz against
+// the live terrain height wherever it's needed.
 public readonly struct Spring
 {
-  public int TileX { get; }
-  public int TileZ { get; }
+  // Collision footprint, in fine voxels — see TileMap.CanOccupy. Height is
+  // 0: a spring never blocks movement, same as always — you can walk
+  // straight over it.
+  public const int Footprint = 7;
+  public const int Height = 0;
 
-  public Spring(int tileX, int tileZ)
+  public int AnchorFx { get; }
+  public int AnchorFz { get; }
+
+  public Spring(int anchorFx, int anchorFz)
   {
-    TileX = tileX;
-    TileZ = tileZ;
+    AnchorFx = anchorFx;
+    AnchorFz = anchorFz;
   }
 }

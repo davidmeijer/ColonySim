@@ -5,18 +5,24 @@ namespace ColonySim.World;
 // glows at night via a point light (SunLight.SetPointLights). FlickerPhase
 // gives each fire its own flame rhythm so a cluster of them doesn't pulse in
 // lockstep. Position isn't cached here — like Tree and Bush, world position
-// is recomputed from TileX/TileZ against the live terrain height wherever
-// it's needed.
+// is recomputed from AnchorFx/AnchorFz against the live terrain height
+// wherever it's needed.
 public readonly struct Campfire
 {
-  public int TileX { get; }
-  public int TileZ { get; }
+  // Collision footprint/height, in fine voxels — see TileMap.CanOccupy.
+  // 9 (not 10) so the footprint is exactly centered on its anchor voxel —
+  // visually indistinguishable from the old 10-wide, tile-aligned version.
+  public const int Footprint = 9;
+  public const int Height = 3;
+
+  public int AnchorFx { get; }
+  public int AnchorFz { get; }
   public float FlickerPhase { get; }
 
-  public Campfire(int tileX, int tileZ, float flickerPhase)
+  public Campfire(int anchorFx, int anchorFz, float flickerPhase)
   {
-    TileX = tileX;
-    TileZ = tileZ;
+    AnchorFx = anchorFx;
+    AnchorFz = anchorFz;
     FlickerPhase = flickerPhase;
   }
 }

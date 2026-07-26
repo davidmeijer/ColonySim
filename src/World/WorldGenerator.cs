@@ -42,14 +42,14 @@ public static class WorldGenerator
       springs.Add(HighestTile(height, width, depth, fineSubdivisions));
 
     var trees = ScatterTrees(width, depth, fineSubdivisions, top, rng);
-    var treeTiles = trees.Select(t => (t.TileX, t.TileZ)).ToHashSet();
-    var bushes = ScatterBushes(width, depth, fineSubdivisions, top, treeTiles, rng);
+    var treeCoarseTiles = trees.Select(t => (t.AnchorFx / fineSubdivisions, t.AnchorFz / fineSubdivisions)).ToHashSet();
+    var bushes = ScatterBushes(width, depth, fineSubdivisions, top, treeCoarseTiles, rng);
 
     // A spring on a tile a tree or bush also landed on would be hidden
     // under it, so those lose — the spring was placed first and is the
     // more important of the two.
-    trees.RemoveAll(t => springs.Contains((t.TileX, t.TileZ)));
-    bushes.RemoveAll(b => springs.Contains((b.TileX, b.TileZ)));
+    trees.RemoveAll(t => springs.Contains((t.AnchorFx / fineSubdivisions, t.AnchorFz / fineSubdivisions)));
+    bushes.RemoveAll(b => springs.Contains((b.AnchorFx / fineSubdivisions, b.AnchorFz / fineSubdivisions)));
 
     return new Result
     {
@@ -188,7 +188,7 @@ public static class WorldGenerator
 
         int trunkHeight = 3 + rng.Next(3);  // 3-5
         int canopyHeight = 3 + rng.Next(2); // 3-4
-        trees.Add(new Tree(tx, tz, trunkHeight, canopyHeight));
+        trees.Add(new Tree(fx, fz, trunkHeight, canopyHeight));
         occupied.Add((tx, tz));
       }
     }
@@ -221,7 +221,7 @@ public static class WorldGenerator
       int layers = 1 + rng.Next(2);       // 1-2
       int sizeVariant = rng.Next(3);      // 0-2
       int colorVariant = rng.Next(3);     // 0-2
-      bushes.Add(new Bush(tx, tz, layers, sizeVariant, colorVariant));
+      bushes.Add(new Bush(fx, fz, layers, sizeVariant, colorVariant));
       occupied.Add((tx, tz));
     }
 
