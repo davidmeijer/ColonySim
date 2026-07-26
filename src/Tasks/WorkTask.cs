@@ -16,10 +16,13 @@ public class WorkTask
 
   // The fine voxel a worker has to be standing on to perform the work.
   // Equal to FineX/FineZ for Dig/Deposit and for any build/demolish whose
-  // target doesn't block its own footprint (Spring always; LightPost/
-  // Campfire while building, since nothing's placed yet to block); resolved
-  // to a nearby free voxel instead when the target already blocks its own
-  // footprint (DemolishCampfire, DemolishLightPost).
+  // target never blocks its own footprint (Spring, in both directions —
+  // see Spring.Height). Resolved to a nearby free voxel instead whenever
+  // the target's footprint is (or is about to become) blocked: Demolish*
+  // because the structure is already standing there, and BuildCampfire/
+  // BuildLightPost because the structure gets placed — and blocks its own
+  // anchor — the moment the task completes, which would otherwise wall the
+  // worker in right where it's standing.
   public int StandX { get; }
   public int StandZ { get; }
 

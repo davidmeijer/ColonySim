@@ -1163,8 +1163,11 @@ public static class Program
         switch (menu.ArmedTool)
         {
             case ToolKind.Campfire:
-                if (map.CanPlaceCampfire(fx, fz))
-                    workQueue.Enqueue(new WorkTask(TaskKind.BuildCampfire, fx, fz, fx, fz, BuildCampfireDuration));
+                if (map.CanPlaceCampfire(fx, fz) &&
+                    NearestWalkableNeighborOfFootprint(map, fx, fz, Campfire.Footprint) is { } fireBuildStand)
+                {
+                    workQueue.Enqueue(new WorkTask(TaskKind.BuildCampfire, fx, fz, fireBuildStand.Fx, fireBuildStand.Fz, BuildCampfireDuration));
+                }
                 menu.ArmedTool = ToolKind.None;
                 break;
 
@@ -1189,11 +1192,12 @@ public static class Program
                     workQueue.Enqueue(new WorkTask(TaskKind.DemolishSpring, spring.AnchorFx, spring.AnchorFz, spring.AnchorFx, spring.AnchorFz, DemolishSpringDuration));
                 break;
 
-            // A fresh light post isn't placed yet, so nothing blocks its own
-            // anchor — the worker stands right on it, same as a spring.
             case ToolKind.LightPost:
-                if (map.CanPlaceLightPost(fx, fz))
-                    workQueue.Enqueue(new WorkTask(TaskKind.BuildLightPost, fx, fz, fx, fz, BuildLightPostDuration));
+                if (map.CanPlaceLightPost(fx, fz) &&
+                    NearestWalkableNeighborOfFootprint(map, fx, fz, LightPost.Footprint) is { } postBuildStand)
+                {
+                    workQueue.Enqueue(new WorkTask(TaskKind.BuildLightPost, fx, fz, postBuildStand.Fx, postBuildStand.Fz, BuildLightPostDuration));
+                }
                 menu.ArmedTool = ToolKind.None;
                 break;
 
@@ -1278,9 +1282,11 @@ public static class Program
     }
 
     // The nearest fine voxel a builder can actually stand on, just outside
-    // a footprint of voxels that's blocked (or about to be) — where a
-    // DemolishCampfire/DemolishLightPost task's worker has to stand, since
-    // it can't stand inside the footprint it's demolishing. Walks the ring
+    // a footprint of voxels that's blocked (or about to be). Used both by
+    // Demolish tasks (the footprint is already blocked) and by Build tasks
+    // whose finished structure would block its own anchor (Campfire,
+    // LightPost) — standing just outside means the worker never gets walled
+    // into the footprint the instant the structure is placed. Walks the ring
     // of voxels immediately surrounding the footprint's bounding box, one
     // side at a time. Null in the (rare) case the whole ring is blocked too.
     static (int Fx, int Fz)? NearestWalkableNeighborOfFootprint(TileMap map, int anchorFx, int anchorFz, int footprintSize)
