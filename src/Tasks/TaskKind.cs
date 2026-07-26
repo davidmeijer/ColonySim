@@ -12,4 +12,6 @@ public enum TaskKind
   DemolishCampfire,
   BuildSpring,
   DemolishSpring,
+  BuildLightPost,
+  DemolishLightPost,
 }

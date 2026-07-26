@@ -177,12 +177,12 @@ public static class Program
     static readonly Rectangle BuildButtonRect = new(260, 10, 36, 36);
 
     // Which tool (if any) is currently armed from the build palette.
-    public enum ToolKind { None, Campfire, DemolishCampfire, Spring, DemolishSpring, Dig, Deposit }
+    public enum ToolKind { None, Campfire, DemolishCampfire, Spring, DemolishSpring, LightPost, DemolishLightPost, Dig, Deposit }
 
     const float BuildPanelWidth = 150f;
     const float BuildPanelX = 260f;
     const float BuildPanelY = 56f;
-    const int BuildPaletteRows = 6;
+    const int BuildPaletteRows = 8;
     const float BuildRowHeight = 46f;
     static readonly Rectangle BuildPanelRect = new(BuildPanelX, BuildPanelY, BuildPanelWidth, 8f + BuildPaletteRows * BuildRowHeight);
 
@@ -191,8 +191,10 @@ public static class Program
     static readonly Rectangle DemolishCampfireItemRect = BuildPaletteItemRect(1);
     static readonly Rectangle SpringItemRect = BuildPaletteItemRect(2);
     static readonly Rectangle DemolishSpringItemRect = BuildPaletteItemRect(3);
-    static readonly Rectangle DigItemRect = BuildPaletteItemRect(4);
-    static readonly Rectangle DepositItemRect = BuildPaletteItemRect(5);
+    static readonly Rectangle LightPostItemRect = BuildPaletteItemRect(4);
+    static readonly Rectangle DemolishLightPostItemRect = BuildPaletteItemRect(5);
+    static readonly Rectangle DigItemRect = BuildPaletteItemRect(6);
+    static readonly Rectangle DepositItemRect = BuildPaletteItemRect(7);
 
     public class BuildMenuState
     {
@@ -245,6 +247,9 @@ public static class Program
     // noticeably longer to open than a campfire takes to lay.
     const float BuildSpringDuration = 4f;
     const float DemolishSpringDuration = 2f;
+
+    const float BuildLightPostDuration = 1f;
+    const float DemolishLightPostDuration = 0.5f;
 
     // Safety clamp on a single drag-select's footprint (Dig/Deposit) — the
     // queue and per-frame builder scans are all O(task count), so a stray
@@ -652,7 +657,7 @@ public static class Program
     // (deposit-lean) pose or the destructive (dig-chop) one.
     static bool IsConstructive(WorkTask task) => task.Kind switch
     {
-        TaskKind.BuildCampfire or TaskKind.BuildSpring or TaskKind.Deposit => true,
+        TaskKind.BuildCampfire or TaskKind.BuildSpring or TaskKind.BuildLightPost or TaskKind.Deposit => true,
         _ => false,
     };
 
@@ -667,6 +672,8 @@ public static class Program
         TaskKind.DemolishCampfire => map.RemoveCampfire(task.TileX, task.TileZ),
         TaskKind.BuildSpring => map.PlaceSpring(task.TileX, task.TileZ) != null,
         TaskKind.DemolishSpring => map.RemoveSpring(task.TileX, task.TileZ),
+        TaskKind.BuildLightPost => map.PlaceLightPost(task.TileX, task.TileZ) != null,
+        TaskKind.DemolishLightPost => map.RemoveLightPost(task.TileX, task.TileZ),
         _ => true,
     };
 
@@ -1130,6 +1137,8 @@ public static class Program
             if (Raylib.CheckCollisionPointRec(mouse, DemolishCampfireItemRect)) { menu.ArmedTool = ToolKind.DemolishCampfire; menu.Open = false; return true; }
             if (Raylib.CheckCollisionPointRec(mouse, SpringItemRect)) { menu.ArmedTool = ToolKind.Spring; menu.Open = false; return true; }
             if (Raylib.CheckCollisionPointRec(mouse, DemolishSpringItemRect)) { menu.ArmedTool = ToolKind.DemolishSpring; menu.Open = false; return true; }
+            if (Raylib.CheckCollisionPointRec(mouse, LightPostItemRect)) { menu.ArmedTool = ToolKind.LightPost; menu.Open = false; return true; }
+            if (Raylib.CheckCollisionPointRec(mouse, DemolishLightPostItemRect)) { menu.ArmedTool = ToolKind.DemolishLightPost; menu.Open = false; return true; }
             if (Raylib.CheckCollisionPointRec(mouse, DigItemRect)) { menu.ArmedTool = ToolKind.Dig; menu.Open = false; return true; }
             if (Raylib.CheckCollisionPointRec(mouse, DepositItemRect)) { menu.ArmedTool = ToolKind.Deposit; menu.Open = false; return true; }
 
@@ -1149,7 +1158,7 @@ public static class Program
     {
         if (!TryPickTile(map, camera, Raylib.GetMousePosition(), out int tx, out int tz))
         {
-            if (menu.ArmedTool is ToolKind.Campfire or ToolKind.Spring) menu.ArmedTool = ToolKind.None;
+            if (menu.ArmedTool is ToolKind.Campfire or ToolKind.Spring or ToolKind.LightPost) menu.ArmedTool = ToolKind.None;
             return;
         }
 
@@ -1180,6 +1189,19 @@ public static class Program
             case ToolKind.DemolishSpring:
                 if (map.Springs.Any(s => s.TileX == tx && s.TileZ == tz))
                     workQueue.Enqueue(WorkTask.ForTile(TaskKind.DemolishSpring, tx, tz, tx, tz, DemolishSpringDuration));
+                break;
+
+            // A light post doesn't block its own tile either, so the worker
+            // stands right on it, same as a spring.
+            case ToolKind.LightPost:
+                if (map.CanPlaceLightPost(tx, tz))
+                    workQueue.Enqueue(WorkTask.ForTile(TaskKind.BuildLightPost, tx, tz, tx, tz, BuildLightPostDuration));
+                menu.ArmedTool = ToolKind.None;
+                break;
+
+            case ToolKind.DemolishLightPost:
+                if (map.LightPosts.Any(l => l.TileX == tx && l.TileZ == tz))
+                    workQueue.Enqueue(WorkTask.ForTile(TaskKind.DemolishLightPost, tx, tz, tx, tz, DemolishLightPostDuration));
                 break;
         }
     }
@@ -1328,6 +1350,11 @@ public static class Program
             pointLightPositions.Add(pos);
             pointLightColors.Add(color);
         }
+        foreach (var (pos, color) in map.LightPostLights())
+        {
+            pointLightPositions.Add(pos);
+            pointLightColors.Add(color);
+        }
         sun.SetPointLights(pointLightPositions, pointLightColors);
 
         // Rendered from the light's point of view into its own depth
@@ -1348,6 +1375,7 @@ public static class Program
         // Campfire flames are unlit for the same reason the sun/moon are —
         // they're the light source, not something the light should shade.
         map.DrawCampfiresGlow();
+        map.DrawLightPostsGlow();
 
         // Lit pass: shading depends on which way each face points, so the
         // sun alone gives hills a sense of depth.
@@ -1358,6 +1386,7 @@ public static class Program
         map.DrawBushes();
         map.DrawCampfiresLit();
         map.DrawSpringsLit();
+        map.DrawLightPostsLit();
         foreach (var actor in actors) actor.DrawSolid(showPathDots);
 
         // Water goes last in the lit pass: it's the only translucent thing
@@ -1386,7 +1415,8 @@ public static class Program
         // tool is armed: orange for Campfire (matching its previous
         // colour), blue-ish for Dig/Deposit, red whenever the hovered spot
         // isn't a legal target — so the player knows before clicking.
-        if (buildMenu.ArmedTool is ToolKind.Campfire or ToolKind.DemolishCampfire or ToolKind.Spring or ToolKind.DemolishSpring &&
+        if (buildMenu.ArmedTool is ToolKind.Campfire or ToolKind.DemolishCampfire or ToolKind.Spring or ToolKind.DemolishSpring
+                or ToolKind.LightPost or ToolKind.DemolishLightPost &&
             TryPickTile(map, camera, Raylib.GetMousePosition(), out int hoverX, out int hoverZ))
         {
             bool valid = buildMenu.ArmedTool switch
@@ -1394,15 +1424,22 @@ public static class Program
                 ToolKind.Campfire => map.CanPlaceCampfire(hoverX, hoverZ),
                 ToolKind.Spring => map.CanPlaceSpring(hoverX, hoverZ),
                 ToolKind.DemolishSpring => map.Springs.Any(s => s.TileX == hoverX && s.TileZ == hoverZ),
+                ToolKind.LightPost => map.CanPlaceLightPost(hoverX, hoverZ),
+                ToolKind.DemolishLightPost => map.LightPosts.Any(l => l.TileX == hoverX && l.TileZ == hoverZ),
                 _ => map.Campfires.Any(f => f.TileX == hoverX && f.TileZ == hoverZ),
             };
 
-            // Springs preview blue rather than the campfire's orange —
-            // they're the one build tool whose whole point is water.
-            bool watery = buildMenu.ArmedTool is ToolKind.Spring or ToolKind.DemolishSpring;
-            Color ringColor = valid
-                ? (watery ? new Color(80, 170, 255, 220) : new Color(255, 170, 60, 220))
-                : new Color(220, 60, 60, 220);
+            // Springs preview blue rather than the campfire's orange — they're
+            // the one build tool whose whole point is water; light posts get
+            // their own pale cyan, close to the actual glow colour they cast.
+            Color ringColor = !valid
+                ? new Color(220, 60, 60, 220)
+                : buildMenu.ArmedTool switch
+                {
+                    ToolKind.Spring or ToolKind.DemolishSpring => new Color(80, 170, 255, 220),
+                    ToolKind.LightPost or ToolKind.DemolishLightPost => new Color(140, 210, 255, 220),
+                    _ => new Color(255, 170, 60, 220),
+                };
 
             Vector3 ringCenter = new(
                 hoverX * TileMap.TileSize + TileMap.TileSize / 2f,
@@ -1627,6 +1664,8 @@ public static class Program
                 ToolKind.DemolishCampfire => "Click a campfire to demolish it (Esc / right-click to cancel)",
                 ToolKind.Spring => "Click a tile to dig a spring there (Esc / right-click to cancel)",
                 ToolKind.DemolishSpring => "Click a spring to cap it (Esc / right-click to cancel)",
+                ToolKind.LightPost => "Click a tile to place the light post (Esc / right-click to cancel)",
+                ToolKind.DemolishLightPost => "Click a light post to remove it (Esc / right-click to cancel)",
                 ToolKind.Dig or ToolKind.Deposit => "Click a voxel, or drag to select several (Esc / right-click to cancel)",
                 _ => "",
             };
@@ -1642,6 +1681,8 @@ public static class Program
         DrawButton(DemolishCampfireItemRect, "Demolish Fire");
         DrawButton(SpringItemRect, "Spring");
         DrawButton(DemolishSpringItemRect, "Cap Spring");
+        DrawButton(LightPostItemRect, "Light Post");
+        DrawButton(DemolishLightPostItemRect, "Remove Post");
         DrawButton(DigItemRect, "Dig");
         DrawButton(DepositItemRect, "Deposit");
     }

@@ -22,7 +22,7 @@ public static class SaveSystem
   // Bumped whenever the file layout below changes, so a save from an older
   // build fails loudly (see Load) instead of silently misreading fields.
   const uint Magic = 0x4D495343; // "CSIM"
-  const int Version = 1;
+  const int Version = 2;
 
   public static void Save(string path, Program.GameSession session)
   {
@@ -76,6 +76,12 @@ public static class SaveSystem
     foreach (var s in map.Springs)
     {
       w.Write(s.TileX); w.Write(s.TileZ);
+    }
+
+    w.Write(map.LightPosts.Count);
+    foreach (var l in map.LightPosts)
+    {
+      w.Write(l.TileX); w.Write(l.TileZ);
     }
 
     w.Write(session.Actors.Count);
@@ -161,6 +167,10 @@ public static class SaveSystem
     int springCount = r.ReadInt32();
     for (int i = 0; i < springCount; i++)
       map.AddLoadedSpring(new Spring(r.ReadInt32(), r.ReadInt32()));
+
+    int lightPostCount = r.ReadInt32();
+    for (int i = 0; i < lightPostCount; i++)
+      map.AddLoadedLightPost(new LightPost(r.ReadInt32(), r.ReadInt32()));
 
     map.FinishLoading();
 

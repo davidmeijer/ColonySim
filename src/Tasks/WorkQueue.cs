@@ -44,6 +44,8 @@ public class WorkQueue
     TaskKind.DemolishCampfire => !map.Campfires.Any(f => f.TileX == t.TileX && f.TileZ == t.TileZ),
     TaskKind.BuildSpring => map.Springs.Any(s => s.TileX == t.TileX && s.TileZ == t.TileZ),
     TaskKind.DemolishSpring => !map.Springs.Any(s => s.TileX == t.TileX && s.TileZ == t.TileZ),
+    TaskKind.BuildLightPost => map.LightPosts.Any(l => l.TileX == t.TileX && l.TileZ == t.TileZ),
+    TaskKind.DemolishLightPost => !map.LightPosts.Any(l => l.TileX == t.TileX && l.TileZ == t.TileZ),
     _ => false,
   };
 
@@ -63,6 +65,8 @@ public class WorkQueue
       TaskKind.DemolishCampfire => true,
       TaskKind.BuildSpring => map.CanPlaceSpring(t.TileX, t.TileZ),
       TaskKind.DemolishSpring => true,
+      TaskKind.BuildLightPost => map.CanPlaceLightPost(t.TileX, t.TileZ),
+      TaskKind.DemolishLightPost => true,
       _ => false,
     };
   }

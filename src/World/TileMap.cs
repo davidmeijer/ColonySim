@@ -137,6 +137,12 @@ public class TileMap
   // refreshed — see UpdateVegetation.
   float _campfireTime;
 
+  // Light posts, placed by the player through the build menu. Unlike a
+  // campfire, a post doesn't block its own tile — it's a thin thing meant
+  // to sit right alongside (or on) a path without getting in anyone's way.
+  readonly List<LightPost> _lightPosts = new();
+  readonly HashSet<(int X, int Z)> _lightPostTiles = new();
+
   // Rendering: one Model per chunk of the fine grid. Tracked per chunk
   // (not one global flag) and rebuilt only where something actually
   // changed — an advancing stream muddies fresh ground every tick, so
@@ -298,7 +304,13 @@ public class TileMap
     _springTiles.Add((spring.TileX, spring.TileZ));
   }
 
-  // Called once every voxel/tree/bush/campfire/spring has been poured back
+  public void AddLoadedLightPost(LightPost lightPost)
+  {
+    _lightPosts.Add(lightPost);
+    _lightPostTiles.Add((lightPost.TileX, lightPost.TileZ));
+  }
+
+  // Called once every voxel/tree/bush/campfire/spring/light post has been poured back
   // in — makes sure every chunk actually gets (re)built from the loaded
   // state on the first frame rather than relying on whatever dirty flags
   // happened to be left over.
@@ -1014,6 +1026,62 @@ public class TileMap
     return true;
   }
 
+  // --- Light Posts ---------------------------------------------------------
+
+  public IReadOnlyList<LightPost> LightPosts => _lightPosts;
+
+  // Same open-ground rule as a spring — doesn't need to be dry (a post next
+  // to water is exactly where you'd want one) and doesn't check IsWalkable,
+  // since a post is allowed to stand on ground something else already
+  // occupies-adjacent-to; it just can't double up on another post or a tree/
+  // bush/campfire actually sitting on the same tile.
+  public bool CanPlaceLightPost(int x, int z) =>
+    InBounds(x, z) &&
+    TopMaterial(x, z) != TileType.Rock &&
+    !_treeTiles.Contains((x, z)) &&
+    !_bushTiles.Contains((x, z)) &&
+    !_campfireTiles.Contains((x, z)) &&
+    !_lightPostTiles.Contains((x, z));
+
+  public LightPost? PlaceLightPost(int x, int z)
+  {
+    if (!CanPlaceLightPost(x, z)) return null;
+
+    var post = new LightPost(x, z);
+    _lightPosts.Add(post);
+    _lightPostTiles.Add((x, z));
+    return post;
+  }
+
+  public bool RemoveLightPost(int x, int z)
+  {
+    int index = _lightPosts.FindIndex(l => l.TileX == x && l.TileZ == z);
+    if (index < 0) return false;
+
+    _lightPosts.RemoveAt(index);
+    _lightPostTiles.Remove((x, z));
+    return true;
+  }
+
+  // A point light per light post, steady and faint blue — the whole point
+  // is to mark a path at night without turning it into another campfire, so
+  // this deliberately skips Flicker's per-frame animation. Height matches
+  // where the glowing cap cube is actually drawn (see DrawLightPostsGlow),
+  // so the light appears to come from the visible cube, not float above it.
+  static readonly Vector3 LightPostLightColor = new(0.22f, 0.42f, 0.85f);
+  const float LightPostLightHeight = PostHeight + PostCapSize / 2f;
+
+  public IEnumerable<(Vector3 Position, Vector3 Color)> LightPostLights()
+  {
+    foreach (var post in _lightPosts)
+    {
+      float worldX = post.TileX * TileSize + TileSize / 2f;
+      float worldZ = post.TileZ * TileSize + TileSize / 2f;
+      float baseY = SmoothSurfaceY(worldX, worldZ);
+      yield return (new Vector3(worldX, baseY + LightPostLightHeight, worldZ), LightPostLightColor);
+    }
+  }
+
   // --- Drawing ---
   //
   // Real voxel cubes again (not a blended mesh): every fine column draws
@@ -1649,6 +1717,46 @@ public class TileMap
           worldZ + MathF.Sin(a) * SpringRingRadius);
         Raylib.DrawCube(stonePos, TileSize * 0.15f, TileSize * 0.16f, TileSize * 0.15f, SpringStoneColor);
       }
+    }
+  }
+
+  // A light post: a slim dark-gray stick, ordinary lit geometry like a
+  // campfire's logs. The glowing cube on top is drawn separately, unlit, by
+  // DrawLightPostsGlow — see that method for why.
+  const float PostHeight = TileSize * 0.75f;
+  const float PostThickness = TileSize * 0.08f;
+  static readonly Color PostColor = new(58, 58, 62, 255);
+
+  public void DrawLightPostsLit()
+  {
+    foreach (var post in _lightPosts)
+    {
+      float worldX = post.TileX * TileSize + TileSize / 2f;
+      float worldZ = post.TileZ * TileSize + TileSize / 2f;
+      float baseY = SmoothSurfaceY(worldX, worldZ);
+
+      Vector3 stickCenter = new(worldX, baseY + PostHeight / 2f, worldZ);
+      Raylib.DrawCube(stickCenter, PostThickness, PostHeight, PostThickness, PostColor);
+    }
+  }
+
+  // The glowing cube on top: unlit, like a campfire's flame, so it stays
+  // vividly visible regardless of ambient darkness — it IS the light, not
+  // something lit by it. No flicker (unlike a flame) since a lamp should
+  // read as steady, not guttering.
+  const float PostCapSize = TileSize * 0.14f;
+  static readonly Color PostCapColor = new(120, 190, 255, 235);
+
+  public void DrawLightPostsGlow()
+  {
+    foreach (var post in _lightPosts)
+    {
+      float worldX = post.TileX * TileSize + TileSize / 2f;
+      float worldZ = post.TileZ * TileSize + TileSize / 2f;
+      float baseY = SmoothSurfaceY(worldX, worldZ);
+
+      Vector3 capCenter = new(worldX, baseY + PostHeight + PostCapSize / 2f, worldZ);
+      Raylib.DrawCube(capCenter, PostCapSize, PostCapSize, PostCapSize, PostCapColor);
     }
   }
 

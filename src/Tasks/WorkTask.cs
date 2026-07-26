@@ -80,6 +80,8 @@ public class WorkTask
     TaskKind.DemolishCampfire => $"Demolish campfire ({TileX},{TileZ})",
     TaskKind.BuildSpring => $"Dig spring ({TileX},{TileZ})",
     TaskKind.DemolishSpring => $"Cap spring ({TileX},{TileZ})",
+    TaskKind.BuildLightPost => $"Build light post ({TileX},{TileZ})",
+    TaskKind.DemolishLightPost => $"Remove light post ({TileX},{TileZ})",
     _ => Kind.ToString(),
   };
 }
