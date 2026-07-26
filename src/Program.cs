@@ -31,6 +31,7 @@ public static class Program
         public BuildMenuState BuildMenu = new();
         public WorkQueue WorkQueue = new();
         public Inventory GlobalInventory = new(capacity: 100_000);
+        public List<ItemDrop> ItemDrops = new();
         public SunLight Sun = null!;
         public Camera3D Camera;
         public Vector3 CamTarget;
@@ -512,8 +513,32 @@ public static class Program
         foreach (var actor in actors) actor.Update(dt);
         ResolveOverlaps(actors);
         RepathStuckActors(map, actors);
-        UpdateBuilders(map, actors, workQueue, globalInventory, dt);
+        UpdateBuilders(map, actors, workQueue, globalInventory, session.ItemDrops, dt);
         UpdateWandering(map, actors, workQueue);
+        UpdateItemDrops(session.ItemDrops, actors, globalInventory, dt);
+    }
+
+    // Ages every drop (spin/bob) and sweeps up any that an actor has walked
+    // over. Runs after UpdateBuilders so a voxel dug this very frame can't
+    // also be collected in the same frame — its drop hasn't had a chance to
+    // exist for any actor to be standing on top of yet — and after actor
+    // movement, so pickup is checked against where actors actually ended up
+    // this frame, not last frame's position.
+    static void UpdateItemDrops(List<ItemDrop> itemDrops, List<Actor> actors, Inventory globalInventory, float dt)
+    {
+        foreach (var drop in itemDrops) drop.Update(dt);
+
+        for (int i = itemDrops.Count - 1; i >= 0; i--)
+        {
+            var drop = itemDrops[i];
+            bool collected = actors.Any(a => Vector2.DistanceSquared(
+                new Vector2(a.WorldPos.X, a.WorldPos.Z), new Vector2(drop.GroundPos.X, drop.GroundPos.Z))
+                <= ItemDrop.PickupRadius * ItemDrop.PickupRadius);
+
+            if (!collected) continue;
+            globalInventory.Add(drop.Kind, drop.Amount);
+            itemDrops.RemoveAt(i);
+        }
     }
 
     // Soft collision: pushes any pair of actors that end up closer than two
@@ -585,7 +610,7 @@ public static class Program
     // UpdateWandering (so a builder with real work available never gets
     // sent ambling instead of doing it — once TryAssignTask gives it a
     // path, IsMoving is true and WantsToWander naturally no longer holds).
-    static void UpdateBuilders(TileMap map, List<Actor> actors, WorkQueue workQueue, Inventory globalInventory, float dt)
+    static void UpdateBuilders(TileMap map, List<Actor> actors, WorkQueue workQueue, Inventory globalInventory, List<ItemDrop> itemDrops, float dt)
     {
         workQueue.Prune(map);
 
@@ -616,7 +641,7 @@ public static class Program
             // effect. Dig always succeeds; Deposit can come up short on
             // material and just keeps waiting here, retried every
             // subsequent frame, until the pool refills.
-            if (TryComplete(task, map, globalInventory))
+            if (TryComplete(task, map, globalInventory, itemDrops))
             {
                 actor.StopWorking();
                 task.Complete = true;
@@ -672,9 +697,9 @@ public static class Program
     // Applies a finished task's effect. Returns false only for Deposit
     // running out of material right at the moment of completion —
     // everything else always succeeds once its Duration has elapsed.
-    static bool TryComplete(WorkTask task, TileMap map, Inventory globalInventory) => task.Kind switch
+    static bool TryComplete(WorkTask task, TileMap map, Inventory globalInventory, List<ItemDrop> itemDrops) => task.Kind switch
     {
-        TaskKind.Dig => CompleteDig(task, map, globalInventory),
+        TaskKind.Dig => CompleteDig(task, map, itemDrops),
         TaskKind.Deposit => CompleteDeposit(task, map, globalInventory),
         TaskKind.BuildCampfire => map.PlaceCampfire(task.FineX, task.FineZ) != null,
         TaskKind.DemolishCampfire => map.RemoveCampfire(task.FineX, task.FineZ),
@@ -688,11 +713,20 @@ public static class Program
     // A voxel that's since become undiggable (someone else got there first,
     // or the terrain changed underneath) is still a "done, nothing more to
     // do" outcome, not a stall — only Deposit's material check can actually
-    // hold a task open waiting.
-    static bool CompleteDig(WorkTask task, TileMap map, Inventory globalInventory)
+    // hold a task open waiting. The dug material doesn't go straight into
+    // the global Inventory any more — it's left behind as a hovering
+    // ItemDrop (see UpdateItemDrops) that only lands in storage once an
+    // actor actually walks over it.
+    static bool CompleteDig(WorkTask task, TileMap map, List<ItemDrop> itemDrops)
     {
         int dug = map.DigVoxel(task.FineX, task.FineZ);
-        if (dug > 0) globalInventory.Add("Dirt", dug);
+        if (dug > 0)
+        {
+            float worldX = task.FineX * TileMap.VoxelSize + TileMap.VoxelSize / 2f;
+            float worldZ = task.FineZ * TileMap.VoxelSize + TileMap.VoxelSize / 2f;
+            Vector3 groundPos = new(worldX, map.SmoothSurfaceY(worldX, worldZ), worldZ);
+            itemDrops.Add(new ItemDrop("Dirt", dug, groundPos));
+        }
         return true;
     }
 
@@ -1407,6 +1441,7 @@ public static class Program
         map.DrawSpringsLit();
         map.DrawLightPostsLit();
         foreach (var actor in actors) actor.DrawSolid(showPathDots);
+        foreach (var drop in session.ItemDrops) drop.Draw();
 
         // Water goes last in the lit pass: it's the only translucent thing
         // in the scene, so everything it might tint — terrain, springs, an
