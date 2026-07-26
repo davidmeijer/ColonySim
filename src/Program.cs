@@ -14,8 +14,8 @@ public static class Program
     const int ScreenWidth = 1280;
     const int ScreenHeight = 720;
     const int ActorCount = 3;
-    const int WorldWidth = 40;
-    const int WorldDepth = 30;
+    const int WorldWidth = 80;
+    const int WorldDepth = 60;
 
     // Everything a running game needs — built fresh by NewGame or restored
     // by SaveSystem.Load, and torn down by Unload when the window closes or
