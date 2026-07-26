@@ -54,17 +54,23 @@ public static class AStar
             if (current == goal)
                 return Reconstruct(cameFrom, current);
 
-            // Consider the four orthogonal neighbours.
+            // Consider all 8 surrounding neighbours — straight and diagonal
+            // — so a route that's actually diagonal comes back as one
+            // straight diagonal line instead of an orthogonal staircase.
+            // (Actor.Update seeks continuously toward each waypoint, so a
+            // staircase of tiny fine-voxel steps used to visibly read as a
+            // jittery left-right shuffle instead of a smooth diagonal glide.)
             foreach (var neighbour in Neighbours(current))
             {
                 if (closed.Contains(neighbour)) continue;
 
-                // CanStep folds in CanOccupy, plus the max-climb rule: a
-                // neighbour more than half a block higher isn't a valid step
-                // even though it's perfectly occupiable ground on its own.
+                // CanStep folds in CanOccupy, the max-climb rule, and (for a
+                // diagonal neighbour) a corner-cut check against the two
+                // flanking orthogonal voxels.
                 if (!map.CanStep(current.Item1, current.Item2, neighbour.Item1, neighbour.Item2, footprintSize, height)) continue;
 
-                int tentative = gScore[current] + 1; // each step costs 1
+                bool diagonal = current.Item1 != neighbour.Item1 && current.Item2 != neighbour.Item2;
+                int tentative = gScore[current] + (diagonal ? DiagonalCost : StraightCost);
 
                 // If this is a new tile, or a cheaper route to a known tile, record it.
                 if (!gScore.TryGetValue(neighbour, out int existing) || tentative < existing)
@@ -80,9 +86,29 @@ public static class AStar
         return result;
     }
 
-    // Manhattan distance: grid steps between two tiles, ignoring obstacles.
-    static int Heuristic((int X, int Y) a, (int X, int Y) b) =>
-        Math.Abs(a.X - b.X) + Math.Abs(a.Y - b.Y);
+    // Matches Neighbours' step costs below: 10 for a straight step, 14 for a
+    // diagonal one (10*sqrt(2), rounded) — scaled-integer costs so the
+    // PriorityQueue<T,int> and gScore dictionary can stay integer-keyed
+    // instead of switching the whole search to floats.
+    const int StraightCost = 10;
+    const int DiagonalCost = 14;
+
+    // Octile distance: the cheapest possible mix of diagonal and straight
+    // steps between two tiles ignoring obstacles — diagonal steps cover one
+    // of each axis at once, so as many as possible (min(dx,dy)) get taken
+    // before the remainder is walked straight. Matching Neighbours' actual
+    // step costs (rather than reusing plain Manhattan distance) keeps this
+    // admissible now that diagonal moves are cheaper per tile of progress
+    // than two orthogonal ones — an overestimating heuristic would make the
+    // search no longer guaranteed to find the shortest path.
+    static int Heuristic((int X, int Y) a, (int X, int Y) b)
+    {
+        int dx = Math.Abs(a.X - b.X);
+        int dy = Math.Abs(a.Y - b.Y);
+        int diagonal = Math.Min(dx, dy);
+        int straight = Math.Abs(dx - dy);
+        return diagonal * DiagonalCost + straight * StraightCost;
+    }
 
     static IEnumerable<(int, int)> Neighbours((int X, int Y) t)
     {
@@ -90,6 +116,10 @@ public static class AStar
         yield return (t.X - 1, t.Y);
         yield return (t.X, t.Y + 1);
         yield return (t.X, t.Y - 1);
+        yield return (t.X + 1, t.Y + 1);
+        yield return (t.X + 1, t.Y - 1);
+        yield return (t.X - 1, t.Y + 1);
+        yield return (t.X - 1, t.Y - 1);
     }
 
     // Follow cameFrom from the goal back to the start, then reverse.

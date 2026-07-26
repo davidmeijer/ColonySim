@@ -920,17 +920,34 @@ public class TileMap
   }
 
   // Whether a mover can take one step from its footprint centred at
-  // (fromFx, fromFz) to one centred at the adjacent (toFx, toFz): the
-  // destination has to be occupiable on its own terms, and the climb
-  // (compared at the two anchors — footprints wider than 1 voxel only
-  // check their own centre column's rise, a reasonable approximation until
-  // something bigger than today's 1-voxel actor default actually exists)
-  // can't be steeper than half an old block. Stepping down is never
-  // limited — only climbing.
+  // (fromFx, fromFz) to one centred at the adjacent (toFx, toFz) — adjacent
+  // meaning any of the 8 surrounding voxels, straight or diagonal (see
+  // AStar.Neighbours). The destination has to be occupiable on its own
+  // terms, and the climb (compared at the two anchors — footprints wider
+  // than 1 voxel only check their own centre column's rise, a reasonable
+  // approximation until something bigger than today's 1-voxel actor default
+  // actually exists) can't be steeper than half an old block. Stepping down
+  // is never limited — only climbing.
   public bool CanStep(int fromFx, int fromFz, int toFx, int toFz, int footprintSize, int height)
   {
     if (!CanOccupy(toFx, toFz, footprintSize, height)) return false;
-    return _voxelHeight[toFx, toFz] - _voxelHeight[fromFx, fromFz] <= MaxStepUpLevels;
+    if (_voxelHeight[toFx, toFz] - _voxelHeight[fromFx, fromFz] > MaxStepUpLevels) return false;
+
+    // A diagonal step also needs both of its flanking orthogonal steps to
+    // be legal on their own — otherwise it's cutting across the corner of
+    // whatever's blocking (or too steep at) one of those two flanking
+    // voxels, which would read as clipping straight through it rather than
+    // walking around. The recursive calls are always straight steps (one
+    // coordinate is unchanged), so this can't recurse into itself again.
+    int dx = toFx - fromFx;
+    int dz = toFz - fromFz;
+    if (dx != 0 && dz != 0)
+    {
+      if (!CanStep(fromFx, fromFz, toFx, fromFz, footprintSize, height)) return false;
+      if (!CanStep(fromFx, fromFz, fromFx, toFz, footprintSize, height)) return false;
+    }
+
+    return true;
   }
 
   // How many voxels of water are sitting on a coarse tile, sampled at its
