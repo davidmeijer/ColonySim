@@ -32,6 +32,7 @@ public static class Program
         public WorkQueue WorkQueue = new();
         public Inventory GlobalInventory = new(capacity: 100_000);
         public List<ItemDrop> ItemDrops = new();
+        public List<AirStrike> AirStrikes = new();
         public SunLight Sun = null!;
         public Camera3D Camera;
         public Vector3 CamTarget;
@@ -186,12 +187,12 @@ public static class Program
     static readonly Rectangle BuildButtonRect = new(260, 10, 36, 36);
 
     // Which tool (if any) is currently armed from the build palette.
-    public enum ToolKind { None, Campfire, DemolishCampfire, Spring, DemolishSpring, LightPost, DemolishLightPost, Dig, Deposit }
+    public enum ToolKind { None, Campfire, DemolishCampfire, Spring, DemolishSpring, LightPost, DemolishLightPost, Dig, Deposit, AirStrike }
 
     const float BuildPanelWidth = 150f;
     const float BuildPanelX = 260f;
     const float BuildPanelY = 56f;
-    const int BuildPaletteRows = 8;
+    const int BuildPaletteRows = 9;
     const float BuildRowHeight = 46f;
     static readonly Rectangle BuildPanelRect = new(BuildPanelX, BuildPanelY, BuildPanelWidth, 8f + BuildPaletteRows * BuildRowHeight);
 
@@ -204,6 +205,7 @@ public static class Program
     static readonly Rectangle DemolishLightPostItemRect = BuildPaletteItemRect(5);
     static readonly Rectangle DigItemRect = BuildPaletteItemRect(6);
     static readonly Rectangle DepositItemRect = BuildPaletteItemRect(7);
+    static readonly Rectangle AirStrikeItemRect = BuildPaletteItemRect(8);
 
     public class BuildMenuState
     {
@@ -480,7 +482,7 @@ public static class Program
         // action menu, top-right settings) would fire that button instead of
         // placing anything.
         bool armed = buildMenu.ArmedTool != ToolKind.None;
-        bool buildConsumedClick = UpdateBuildMenu(map, workQueue, buildMenu, camera);
+        bool buildConsumedClick = UpdateBuildMenu(map, workQueue, buildMenu, camera, session.AirStrikes);
 
         // The task queue panel (left edge) needs the same treatment: a click
         // on its cancel buttons shouldn't also fall through to a world click.
@@ -515,7 +517,21 @@ public static class Program
         RepathStuckActors(map, actors);
         UpdateBuilders(map, actors, workQueue, globalInventory, session.ItemDrops, dt);
         UpdateWandering(map, actors, workQueue);
+        UpdateAirStrikes(session.AirStrikes, map, session.ItemDrops, dt);
         UpdateItemDrops(session.ItemDrops, actors, globalInventory, dt);
+    }
+
+    // Ages every in-flight strike (its incoming streak, then its debris'
+    // flight once it detonates) and drops any that have finished landing
+    // everything they threw up. Runs before UpdateItemDrops so a chunk that
+    // lands this very frame is already eligible for pickup this same frame.
+    static void UpdateAirStrikes(List<AirStrike> airStrikes, TileMap map, List<ItemDrop> itemDrops, float dt)
+    {
+        for (int i = airStrikes.Count - 1; i >= 0; i--)
+        {
+            airStrikes[i].Update(dt, map, itemDrops);
+            if (airStrikes[i].Done) airStrikes.RemoveAt(i);
+        }
     }
 
     // Ages every drop (spin/bob) and sweeps up any that an actor has walked
@@ -1099,7 +1115,7 @@ public static class Program
     // Escape cancels without closing anything else. Campfire disarms after
     // a single click (placing one thing at a time); every other tool stays
     // armed so the player can stamp out several tasks in a row.
-    static bool UpdateBuildMenu(TileMap map, WorkQueue workQueue, BuildMenuState menu, Camera3D camera)
+    static bool UpdateBuildMenu(TileMap map, WorkQueue workQueue, BuildMenuState menu, Camera3D camera, List<AirStrike> airStrikes)
     {
         Vector2 mouse = Raylib.GetMousePosition();
         bool leftPressed = Raylib.IsMouseButtonPressed(MouseButton.Left);
@@ -1154,7 +1170,7 @@ public static class Program
 
             if (leftPressed)
             {
-                TryPlaceArmedTool(map, workQueue, menu, camera);
+                TryPlaceArmedTool(map, workQueue, menu, camera, airStrikes);
                 return true;
             }
 
@@ -1173,6 +1189,7 @@ public static class Program
             if (Raylib.CheckCollisionPointRec(mouse, DemolishLightPostItemRect)) { menu.ArmedTool = ToolKind.DemolishLightPost; menu.Open = false; return true; }
             if (Raylib.CheckCollisionPointRec(mouse, DigItemRect)) { menu.ArmedTool = ToolKind.Dig; menu.Open = false; return true; }
             if (Raylib.CheckCollisionPointRec(mouse, DepositItemRect)) { menu.ArmedTool = ToolKind.Deposit; menu.Open = false; return true; }
+            if (Raylib.CheckCollisionPointRec(mouse, AirStrikeItemRect)) { menu.ArmedTool = ToolKind.AirStrike; menu.Open = false; return true; }
 
             if (Raylib.CheckCollisionPointRec(mouse, BuildPanelRect)) return true;
 
@@ -1185,12 +1202,16 @@ public static class Program
     // Applies the coarse-tile tools (the campfire and spring pairs) to the
     // footprint under the mouse — queuing a WorkTask on success, doing
     // nothing on an invalid spot. Disarms afterward only for the build
-    // tools; the demolish tools stay armed for repeated stamping.
-    static void TryPlaceArmedTool(TileMap map, WorkQueue workQueue, BuildMenuState menu, Camera3D camera)
+    // tools; the demolish tools stay armed for repeated stamping. AirStrike
+    // is the odd one out: it doesn't go through WorkQueue at all — there's
+    // no worker to send, the strike itself does the digging the moment it
+    // lands (see AirStrike.Detonate) — so it just spawns one directly and
+    // always disarms, same as a single-shot build tool.
+    static void TryPlaceArmedTool(TileMap map, WorkQueue workQueue, BuildMenuState menu, Camera3D camera, List<AirStrike> airStrikes)
     {
         if (!TryPickVoxel(map, camera, Raylib.GetMousePosition(), out int fx, out int fz))
         {
-            if (menu.ArmedTool is ToolKind.Campfire or ToolKind.Spring or ToolKind.LightPost) menu.ArmedTool = ToolKind.None;
+            if (menu.ArmedTool is ToolKind.Campfire or ToolKind.Spring or ToolKind.LightPost or ToolKind.AirStrike) menu.ArmedTool = ToolKind.None;
             return;
         }
 
@@ -1241,6 +1262,11 @@ public static class Program
                 {
                     workQueue.Enqueue(new WorkTask(TaskKind.DemolishLightPost, post.AnchorFx, post.AnchorFz, postStand.Fx, postStand.Fz, DemolishLightPostDuration));
                 }
+                break;
+
+            case ToolKind.AirStrike:
+                airStrikes.Add(new AirStrike(map, fx, fz));
+                menu.ArmedTool = ToolKind.None;
                 break;
         }
     }
@@ -1429,6 +1455,7 @@ public static class Program
         // they're the light source, not something the light should shade.
         map.DrawCampfiresGlow();
         map.DrawLightPostsGlow();
+        foreach (var strike in session.AirStrikes) strike.DrawUnlit();
 
         // Lit pass: shading depends on which way each face points, so the
         // sun alone gives hills a sense of depth.
@@ -1442,6 +1469,7 @@ public static class Program
         map.DrawLightPostsLit();
         foreach (var actor in actors) actor.DrawSolid(showPathDots);
         foreach (var drop in session.ItemDrops) drop.Draw();
+        foreach (var strike in session.AirStrikes) strike.DrawLit();
 
         // Water goes last in the lit pass: it's the only translucent thing
         // in the scene, so everything it might tint — terrain, springs, an
@@ -1529,6 +1557,17 @@ public static class Program
         else if (buildMenu.ArmedTool is ToolKind.Dig or ToolKind.Deposit)
         {
             DrawVoxelToolPreview(map, buildMenu, camera);
+        }
+        else if (buildMenu.ArmedTool == ToolKind.AirStrike &&
+            TryPickVoxel(map, camera, Raylib.GetMousePosition(), out int strikeFx, out int strikeFz))
+        {
+            // A plain ground-level ring rather than a footprint outline —
+            // the blast is a circle (see AirStrike.BlastRadiusVoxels), not
+            // anchored to any building's square footprint.
+            float worldX = strikeFx * TileMap.VoxelSize + TileMap.VoxelSize / 2f;
+            float worldZ = strikeFz * TileMap.VoxelSize + TileMap.VoxelSize / 2f;
+            Vector3 ringCenter = new(worldX, map.SmoothSurfaceY(worldX, worldZ) + 1f, worldZ);
+            Raylib.DrawCircle3D(ringCenter, AirStrike.BlastRadiusVoxels * TileMap.VoxelSize, new Vector3(1f, 0f, 0f), 90f, new Color(255, 120, 40, 220));
         }
 
         Raylib.EndMode3D();
@@ -1777,6 +1816,7 @@ public static class Program
                 ToolKind.LightPost => "Click a tile to place the light post (Esc / right-click to cancel)",
                 ToolKind.DemolishLightPost => "Click a light post to remove it (Esc / right-click to cancel)",
                 ToolKind.Dig or ToolKind.Deposit => "Click a voxel, or drag to select several (Esc / right-click to cancel)",
+                ToolKind.AirStrike => "Click a spot to call in an air strike (Esc / right-click to cancel)",
                 _ => "",
             };
             Raylib.DrawText(hint, (int)BuildButtonRect.X, (int)(BuildButtonRect.Y + BuildButtonRect.Height + 6), 16, Color.Black);
@@ -1795,6 +1835,7 @@ public static class Program
         DrawButton(DemolishLightPostItemRect, "Remove Post");
         DrawButton(DigItemRect, "Dig");
         DrawButton(DepositItemRect, "Deposit");
+        DrawButton(AirStrikeItemRect, "Air Strike");
     }
 
     // A gear-shaped icon button: a ring of teeth around a circular hub,
