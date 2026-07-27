@@ -323,6 +323,29 @@ public class TileMap
     ReserveFootprint(bush.AnchorFx, bush.AnchorFz, Bush.Footprint, Bush.Height);
   }
 
+  // No player-facing way to fell a tree or clear a bush exists yet — these
+  // exist for AirStrike (see DestroyObstaclesIn), same RemoveAt +
+  // UnreserveFootprint pattern as RemoveCampfire/RemoveSpring/RemoveLightPost.
+  public bool RemoveTree(int anchorFx, int anchorFz)
+  {
+    int index = _trees.FindIndex(t => t.AnchorFx == anchorFx && t.AnchorFz == anchorFz);
+    if (index < 0) return false;
+
+    _trees.RemoveAt(index);
+    UnreserveFootprint(anchorFx, anchorFz, Tree.Footprint);
+    return true;
+  }
+
+  public bool RemoveBush(int anchorFx, int anchorFz)
+  {
+    int index = _bushes.FindIndex(b => b.AnchorFx == anchorFx && b.AnchorFz == anchorFz);
+    if (index < 0) return false;
+
+    _bushes.RemoveAt(index);
+    UnreserveFootprint(anchorFx, anchorFz, Bush.Footprint);
+    return true;
+  }
+
   public void AddLoadedCampfire(Campfire campfire)
   {
     _campfires.Add(campfire);
@@ -733,6 +756,66 @@ public class TileMap
     _voxelTop[fx, fz] = TileType.Dirt;
     MarkTerrainChangedAt(fx, fz);
     return true;
+  }
+
+  // Removes exactly the top voxel of one fine column for AirStrike, which —
+  // unlike a hand dig — is allowed to crater through anything except
+  // standing water: no Grass/Dirt-only restriction, and no obstacle check
+  // (callers are expected to have already cleared obstacles in the blast
+  // area via DestroyObstaclesIn). Returns 1 on success, matching DigVoxel's
+  // convention, 0 if there's nothing left to remove or the column's wet.
+  public int BlastVoxel(int fx, int fz)
+  {
+    if (!InBoundsFine(fx, fz)) return 0;
+    if (_voxelHeight[fx, fz] <= 0) return 0;
+    if (_waterSim.DepthAt(fx, fz) > 0f) return 0;
+    _voxelHeight[fx, fz] -= 1;
+    _voxelTop[fx, fz] = TileType.Dirt;
+    MarkTerrainChangedAt(fx, fz);
+    return 1;
+  }
+
+  // Destroys every tree/bush/campfire/spring/light post whose footprint
+  // overlaps any of the given fine columns — an AirStrike catching the edge
+  // of a tree takes out the whole tree, not just whatever voxels sit
+  // directly under its trunk. Each match is unreserved the same way its own
+  // Remove* method would.
+  public void DestroyObstaclesIn(IEnumerable<(int Fx, int Fz)> columns)
+  {
+    var hit = new HashSet<(int Fx, int Fz)>(columns);
+    bool Overlaps(int anchorFx, int anchorFz, int size) =>
+      FootprintVoxels(anchorFx, anchorFz, size).Any(hit.Contains);
+
+    _trees.RemoveAll(t =>
+    {
+      if (!Overlaps(t.AnchorFx, t.AnchorFz, Tree.Footprint)) return false;
+      UnreserveFootprint(t.AnchorFx, t.AnchorFz, Tree.Footprint);
+      return true;
+    });
+    _bushes.RemoveAll(b =>
+    {
+      if (!Overlaps(b.AnchorFx, b.AnchorFz, Bush.Footprint)) return false;
+      UnreserveFootprint(b.AnchorFx, b.AnchorFz, Bush.Footprint);
+      return true;
+    });
+    _campfires.RemoveAll(c =>
+    {
+      if (!Overlaps(c.AnchorFx, c.AnchorFz, Campfire.Footprint)) return false;
+      UnreserveFootprint(c.AnchorFx, c.AnchorFz, Campfire.Footprint);
+      return true;
+    });
+    _springs.RemoveAll(s =>
+    {
+      if (!Overlaps(s.AnchorFx, s.AnchorFz, Spring.Footprint)) return false;
+      UnreserveFootprint(s.AnchorFx, s.AnchorFz, Spring.Footprint);
+      return true;
+    });
+    _lightPosts.RemoveAll(l =>
+    {
+      if (!Overlaps(l.AnchorFx, l.AnchorFz, LightPost.Footprint)) return false;
+      UnreserveFootprint(l.AnchorFx, l.AnchorFz, LightPost.Footprint);
+      return true;
+    });
   }
 
   // --- Campfires ---

@@ -517,19 +517,18 @@ public static class Program
         RepathStuckActors(map, actors);
         UpdateBuilders(map, actors, workQueue, globalInventory, session.ItemDrops, dt);
         UpdateWandering(map, actors, workQueue);
-        UpdateAirStrikes(session.AirStrikes, map, session.ItemDrops, dt);
+        UpdateAirStrikes(session.AirStrikes, map, dt);
         UpdateItemDrops(session.ItemDrops, actors, globalInventory, dt);
     }
 
     // Ages every in-flight strike (its incoming streak, then its debris'
     // flight once it detonates) and drops any that have finished landing
-    // everything they threw up. Runs before UpdateItemDrops so a chunk that
-    // lands this very frame is already eligible for pickup this same frame.
-    static void UpdateAirStrikes(List<AirStrike> airStrikes, TileMap map, List<ItemDrop> itemDrops, float dt)
+    // everything they threw up.
+    static void UpdateAirStrikes(List<AirStrike> airStrikes, TileMap map, float dt)
     {
         for (int i = airStrikes.Count - 1; i >= 0; i--)
         {
-            airStrikes[i].Update(dt, map, itemDrops);
+            airStrikes[i].Update(dt, map);
             if (airStrikes[i].Done) airStrikes.RemoveAt(i);
         }
     }

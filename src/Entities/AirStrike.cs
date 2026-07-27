@@ -5,17 +5,19 @@ using ColonySim.World;
 namespace ColonySim.Entities;
 
 // A player-called-in bombardment: a falling streak of light converges on a
-// targeted voxel, then blasts a shallow crater out of the ground around it —
-// see Program.TryPlaceArmedTool (ToolKind.AirStrike), which is the only
-// place these get created. Every voxel the blast frees is handed to
-// TileMap.DigVoxel exactly like a normal Dig task would, so the same
-// Grass/Dirt-only, no-Rock/no-obstacle/no-deep-water rule already enforced
-// by CanDigVoxel (see its own doc comment) applies here too — the strike
-// can never touch anything a builder couldn't otherwise dig by hand. Each
-// freed voxel then flies up and out in its own little arc and, on landing,
-// turns into the same ItemDrop a manual dig leaves behind, so cleanup after
-// a strike works exactly like cleanup after digging: an actor just has to
-// walk over the debris. Not persisted through SaveSystem — like ItemDrop,
+// targeted voxel, then blasts a bowl-shaped crater out of the ground around
+// it — see Program.TryPlaceArmedTool (ToolKind.AirStrike), which is the only
+// place these get created. Unlike a hand dig, the blast doesn't care what
+// it hits: every tree/bush/campfire/spring/light post caught in the radius
+// is destroyed outright (see TileMap.DestroyObstaclesIn), and literally
+// every column short of standing water gets cratered regardless of material
+// (see TileMap.BlastVoxel) — water is left alone and just flows into the
+// hole afterward, same as it would after a hand-dug channel. The displaced
+// volume doesn't vanish as item drops any more: it's piled back onto the
+// terrain as a mound around the crater's outer rim (see PileRim), sloped
+// gently enough on both its inner and outer edges — same as the bowl itself
+// — that an actor can walk down into the crater and back out again, rather
+// than hitting a wall. Not persisted through SaveSystem — like ItemDrop,
 // it's meant to be short-lived, and a save mid-strike is expected to just
 // lose it.
 public class AirStrike
@@ -35,12 +37,24 @@ public class AirStrike
   // How far out (in fine voxels) the crater reaches from the targeted
   // voxel — public so Program's hover preview can draw the same radius the
   // strike will actually use.
-  public const int BlastRadiusVoxels = 5;
+  public const int BlastRadiusVoxels = 25;
 
-  // How many voxels deep each affected column gets dug, capped by whatever
-  // CanDigVoxel still allows once a column bottoms out on Rock or empty
-  // ground short of that.
-  const int CraterDepth = 2;
+  // How deep the bowl gets at its very centre — tapering down to (but never
+  // below) a single voxel at BlastRadiusVoxels, see Detonate's depth
+  // profile: every column in the blast circle short of standing water gets
+  // dug by at least this much.
+  const int CraterDepth = 10;
+
+  // How far past BlastRadiusVoxels the ejecta mound spreads — a smooth
+  // rise-and-fall across this width, zero height at both ends, see PileRim.
+  const int RimWidthVoxels = 10;
+
+  // Only this fraction of what the bowl actually displaces gets piled back
+  // onto the rim — a real impact throws most of its ejecta well clear of
+  // the crater (dust, scatter, compaction), and depositing the full volume
+  // made the mound read as an unrealistically tall wall of dirt. The rest
+  // is simply removed from the game, same as it always was pre-explosion.
+  const float MoundVolumeFraction = 0.1f;
 
   const float IncomingDuration = 0.35f;
   const float FlashDuration = 0.25f;
@@ -63,7 +77,7 @@ public class AirStrike
     _groundPos = new Vector3(worldX, map.SmoothSurfaceY(worldX, worldZ), worldZ);
   }
 
-  public void Update(float dt, TileMap map, List<ItemDrop> itemDrops)
+  public void Update(float dt, TileMap map)
   {
     _timer += dt;
     if (_flashTimer > 0f) _flashTimer = Math.Max(0f, _flashTimer - dt);
@@ -83,7 +97,6 @@ public class AirStrike
         for (int i = _debris.Count - 1; i >= 0; i--)
         {
           if (!_debris[i].Update(dt)) continue;
-          itemDrops.Add(new ItemDrop("Dirt", 1, _debris[i].LandingPos));
           _debris.RemoveAt(i);
         }
         if (_debris.Count == 0) _phase = Phase.Done;
@@ -91,47 +104,104 @@ public class AirStrike
     }
   }
 
-  // Digs every diggable column within BlastRadiusVoxels (a circle, not a
-  // square footprint — this isn't anchored to any building's shape) up to
-  // CraterDepth layers deep, launching a Debris chunk for each voxel
-  // actually removed. Columns that aren't diggable at all (Rock, an
-  // obstacle, deep water — same checks CanDigVoxel always applies) are
-  // silently skipped rather than the strike failing outright, same as a
-  // Dig drag-select over mixed terrain today.
+  // Carves the crater, destroys anything caught in the blast, and piles the
+  // displaced volume onto the rim. Two passes over the blast circle:
+  //   1. Wipe out every tree/bush/campfire/spring/light post overlapping it.
+  //   2. Dig a bowl — depth tapers from CraterDepth at the centre down to a
+  //      single voxel at the radius, so literally every column short of
+  //      standing water gets touched, and the slope from undisturbed ground
+  //      into the crater is never more than a voxel or two per step (an
+  //      actor can always walk down into it). Wet columns are skipped
+  //      entirely; water floods in on its own.
+  // Then PileRim mounds the dug volume onto the rim.
   void Detonate(TileMap map)
   {
-    var rng = Random.Shared;
     int r2 = BlastRadiusVoxels * BlastRadiusVoxels;
 
+    var craterColumns = new List<(int Fx, int Fz)>();
     for (int dz = -BlastRadiusVoxels; dz <= BlastRadiusVoxels; dz++)
     {
       for (int dx = -BlastRadiusVoxels; dx <= BlastRadiusVoxels; dx++)
       {
         if (dx * dx + dz * dz > r2) continue;
+        craterColumns.Add((_targetFx + dx, _targetFz + dz));
+      }
+    }
 
-        int fx = _targetFx + dx;
-        int fz = _targetFz + dz;
+    map.DestroyObstaclesIn(craterColumns);
 
-        for (int layer = 0; layer < CraterDepth; layer++)
-        {
-          if (!map.CanDigVoxel(fx, fz)) break;
+    var dugColumns = new List<Vector3>(); // pre-dig surface positions, for debris launch points
+    int totalDug = 0;
+    foreach (var (fx, fz) in craterColumns)
+    {
+      float dx = fx - _targetFx, dz = fz - _targetFz;
+      int depth = (int)MathF.Max(1f, MathF.Round(CraterDepth * (1f - (dx * dx + dz * dz) / r2)));
 
-          float worldX = fx * TileMap.VoxelSize + TileMap.VoxelSize / 2f;
-          float worldZ = fz * TileMap.VoxelSize + TileMap.VoxelSize / 2f;
-          Vector3 launchPos = new(worldX, map.SmoothSurfaceY(worldX, worldZ), worldZ);
+      float worldX = fx * TileMap.VoxelSize + TileMap.VoxelSize / 2f;
+      float worldZ = fz * TileMap.VoxelSize + TileMap.VoxelSize / 2f;
+      bool any = false;
+      for (int layer = 0; layer < depth; layer++)
+      {
+        if (map.BlastVoxel(fx, fz) == 0) break;
+        totalDug++;
+        any = true;
+      }
+      if (any) dugColumns.Add(new Vector3(worldX, map.SmoothSurfaceY(worldX, worldZ), worldZ));
+    }
 
-          if (map.DigVoxel(fx, fz) == 0) break;
+    int moundVolume = (int)MathF.Round(totalDug * MoundVolumeFraction);
+    if (moundVolume > 0 && dugColumns.Count > 0) PileRim(map, moundVolume, dugColumns);
+  }
 
-          // Scatter the landing spot a little so debris doesn't all pile
-          // straight back down into the hole it just came out of.
-          float scatterAngle = rng.NextSingle() * MathF.Tau;
-          float scatterDist = rng.NextSingle() * TileMap.VoxelSize * 3f;
-          float landX = worldX + MathF.Cos(scatterAngle) * scatterDist;
-          float landZ = worldZ + MathF.Sin(scatterAngle) * scatterDist;
-          Vector3 landingPos = new(landX, map.SmoothSurfaceY(landX, landZ), landZ);
+  // Mounds moundVolume to the ring just outside the crater as a smooth
+  // sine-shaped rise and fall: zero height right at the crater's own edge,
+  // climbing to a peak roughly midway across RimWidthVoxels, then tapering
+  // back to zero at the outer edge — a gentle slope on both sides of the
+  // heap, instead of a wall dropped flush against the hole. Deterministic
+  // (a pure function of distance, like the crater's own bowl) rather than
+  // randomly scattered, so neighbouring columns never differ by more than
+  // the shape itself calls for. peakHeight is solved from moundVolume so
+  // the mound roughly conserves it; a column that's wet, obstructed, or
+  // already at the height cap just doesn't take its share, so a little
+  // volume can go missing rather than pile up elsewhere.
+  void PileRim(TileMap map, int moundVolume, List<Vector3> dugColumns)
+  {
+    var rng = Random.Shared;
+    int rimOuter = BlastRadiusVoxels + RimWidthVoxels;
 
-          _debris.Add(new Debris(launchPos, landingPos));
-        }
+    var ring = new List<(int Fx, int Fz, float Shape)>();
+    float shapeSum = 0f;
+    for (int dz = -rimOuter; dz <= rimOuter; dz++)
+    {
+      for (int dx = -rimOuter; dx <= rimOuter; dx++)
+      {
+        float r = MathF.Sqrt(dx * dx + dz * dz);
+        if (r <= BlastRadiusVoxels || r > rimOuter) continue;
+        float t = (r - BlastRadiusVoxels) / RimWidthVoxels; // 0 at the crater edge, 1 at the outer edge
+        float shape = MathF.Sin(MathF.PI * t); // 0..1, zero at both ends
+        if (shape <= 0f) continue;
+        ring.Add((_targetFx + dx, _targetFz + dz, shape));
+        shapeSum += shape;
+      }
+    }
+    if (shapeSum <= 0f) return;
+
+    float peakHeight = moundVolume / shapeSum;
+
+    foreach (var (fx, fz, shape) in ring)
+    {
+      int height = (int)MathF.Round(peakHeight * shape);
+      if (height <= 0) continue;
+
+      float worldX = fx * TileMap.VoxelSize + TileMap.VoxelSize / 2f;
+      float worldZ = fz * TileMap.VoxelSize + TileMap.VoxelSize / 2f;
+      for (int i = 0; i < height; i++)
+      {
+        if (!map.DepositVoxel(fx, fz)) break;
+
+        Vector3 landingPos = new(worldX, map.SmoothSurfaceY(worldX, worldZ), worldZ);
+        Vector3 launchPos = dugColumns[rng.Next(dugColumns.Count)];
+        _debris.Add(new Debris(launchPos, landingPos));
       }
     }
   }
@@ -166,13 +236,15 @@ public class AirStrike
   }
 
   // One dug voxel's flight from where it came out of the ground to wherever
-  // it lands — a simple lerp across XZ with a sine arc added on top for
-  // height, same shape as Actor's own jump arc.
+  // it lands on the rim heap — a simple lerp across XZ with a sine arc added
+  // on top for height, same shape as Actor's own jump arc. Purely cosmetic:
+  // the terrain underneath is already carved/piled the instant Detonate
+  // runs, so unlike a manual dig this never leaves anything behind to pick
+  // up once it lands.
   class Debris
   {
-    public Vector3 LandingPos { get; }
-
     readonly Vector3 _start;
+    readonly Vector3 _end;
     readonly float _duration;
     readonly float _arcHeight;
     float _t;
@@ -180,10 +252,10 @@ public class AirStrike
     static readonly Color DirtColor = new(120, 84, 52, 255);
     const float Size = TileMap.TileSize * 0.22f;
 
-    public Debris(Vector3 start, Vector3 landingPos)
+    public Debris(Vector3 start, Vector3 end)
     {
       _start = start;
-      LandingPos = landingPos;
+      _end = end;
       _duration = 0.45f + Random.Shared.NextSingle() * 0.3f;
       _arcHeight = TileMap.TileSize * (1.1f + Random.Shared.NextSingle() * 0.9f);
     }
@@ -198,7 +270,7 @@ public class AirStrike
     public void Draw()
     {
       float t = Math.Clamp(_t, 0f, 1f);
-      Vector3 pos = Vector3.Lerp(_start, LandingPos, t);
+      Vector3 pos = Vector3.Lerp(_start, _end, t);
       pos.Y += MathF.Sin(t * MathF.PI) * _arcHeight;
       Raylib.DrawCube(pos, Size, Size, Size, DirtColor);
     }
