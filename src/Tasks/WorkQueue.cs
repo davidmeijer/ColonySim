@@ -46,6 +46,9 @@ public class WorkQueue
     TaskKind.DemolishSpring => !map.Springs.Any(s => s.AnchorFx == t.FineX && s.AnchorFz == t.FineZ),
     TaskKind.BuildLightPost => map.LightPosts.Any(l => l.AnchorFx == t.FineX && l.AnchorFz == t.FineZ),
     TaskKind.DemolishLightPost => !map.LightPosts.Any(l => l.AnchorFx == t.FineX && l.AnchorFz == t.FineZ),
+    TaskKind.BuildStorageBox => map.StorageBoxes.Any(b => b.AnchorFx == t.FineX && b.AnchorFz == t.FineZ),
+    TaskKind.DemolishStorageBox => !map.StorageBoxes.Any(b => b.AnchorFx == t.FineX && b.AnchorFz == t.FineZ),
+    TaskKind.HarvestBush => !map.Bushes.Any(b => b.AnchorFx == t.FineX && b.AnchorFz == t.FineZ),
     _ => false,
   };
 
@@ -67,6 +70,9 @@ public class WorkQueue
       TaskKind.DemolishSpring => true,
       TaskKind.BuildLightPost => map.CanPlaceLightPost(t.FineX, t.FineZ),
       TaskKind.DemolishLightPost => true,
+      TaskKind.BuildStorageBox => map.CanPlaceStorageBox(t.FineX, t.FineZ),
+      TaskKind.DemolishStorageBox => true,
+      TaskKind.HarvestBush => map.Bushes.Any(b => b.AnchorFx == t.FineX && b.AnchorFz == t.FineZ),
       _ => false,
     };
   }

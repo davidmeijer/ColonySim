@@ -22,7 +22,7 @@ public static class SaveSystem
   // Bumped whenever the file layout below changes, so a save from an older
   // build fails loudly (see Load) instead of silently misreading fields.
   const uint Magic = 0x4D495343; // "CSIM"
-  const int Version = 3;
+  const int Version = 4;
 
   public static void Save(string path, Program.GameSession session)
   {
@@ -84,10 +84,22 @@ public static class SaveSystem
       w.Write(l.AnchorFx); w.Write(l.AnchorFz);
     }
 
+    w.Write(map.StorageBoxes.Count);
+    foreach (var b in map.StorageBoxes)
+    {
+      w.Write(b.AnchorFx); w.Write(b.AnchorFz);
+      w.Write(b.Storage.Counts.Count);
+      foreach (var (item, count) in b.Storage.Counts)
+      {
+        w.Write(item); w.Write(count);
+      }
+    }
+
     w.Write(session.Actors.Count);
     foreach (var a in session.Actors)
     {
       w.Write(a.FineX); w.Write(a.FineZ); w.Write(a.IsBuilder);
+      w.Write(a.Name); w.Write(a.Hunger); w.Write(a.Health);
     }
 
     w.Write(session.GlobalInventory.Counts.Count);
@@ -171,6 +183,17 @@ public static class SaveSystem
     for (int i = 0; i < lightPostCount; i++)
       map.AddLoadedLightPost(new LightPost(r.ReadInt32(), r.ReadInt32()));
 
+    int storageBoxCount = r.ReadInt32();
+    for (int i = 0; i < storageBoxCount; i++)
+    {
+      int boxFx = r.ReadInt32(), boxFz = r.ReadInt32();
+      var storage = new Inventory(StorageBox.Capacity);
+      int boxItemCount = r.ReadInt32();
+      for (int j = 0; j < boxItemCount; j++)
+        storage.Add(r.ReadString(), r.ReadInt32());
+      map.AddLoadedStorageBox(new StorageBox(boxFx, boxFz, storage));
+    }
+
     map.FinishLoading();
 
     int actorCount = r.ReadInt32();
@@ -179,7 +202,11 @@ public static class SaveSystem
     {
       int fx = r.ReadInt32(), fz = r.ReadInt32();
       bool isBuilder = r.ReadBoolean();
-      actors.Add(new Actor(map, fx, fz) { IsBuilder = isBuilder });
+      string name = r.ReadString();
+      float hunger = r.ReadSingle(), health = r.ReadSingle();
+      var actor = new Actor(map, fx, fz, name) { IsBuilder = isBuilder };
+      actor.RestoreNeeds(hunger, health);
+      actors.Add(actor);
     }
 
     var globalInventory = new Inventory(capacity: 100_000);

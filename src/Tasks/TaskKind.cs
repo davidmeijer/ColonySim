@@ -14,4 +14,7 @@ public enum TaskKind
   DemolishSpring,
   BuildLightPost,
   DemolishLightPost,
+  BuildStorageBox,
+  DemolishStorageBox,
+  HarvestBush,
 }

@@ -141,6 +141,10 @@ public class TileMap
   // Light posts, placed by the player through the build menu.
   readonly List<LightPost> _lightPosts = new();
 
+  // Storage boxes, placed by the player through the build menu — see
+  // StorageBox.cs and Program.UpdateHunger.
+  readonly List<StorageBox> _storageBoxes = new();
+
   // Every fine voxel any footprint above (tree/bush/campfire/spring/light
   // post) currently occupies — checked by placement validity so nothing
   // new can overlap something already there, regardless of whether the
@@ -362,6 +366,12 @@ public class TileMap
   {
     _lightPosts.Add(lightPost);
     ReserveFootprint(lightPost.AnchorFx, lightPost.AnchorFz, LightPost.Footprint, LightPost.Height);
+  }
+
+  public void AddLoadedStorageBox(StorageBox box)
+  {
+    _storageBoxes.Add(box);
+    ReserveFootprint(box.AnchorFx, box.AnchorFz, StorageBox.Footprint, StorageBox.Height);
   }
 
   // Called once every voxel/tree/bush/campfire/spring/light post has been poured back
@@ -816,6 +826,12 @@ public class TileMap
       UnreserveFootprint(l.AnchorFx, l.AnchorFz, LightPost.Footprint);
       return true;
     });
+    _storageBoxes.RemoveAll(b =>
+    {
+      if (!Overlaps(b.AnchorFx, b.AnchorFz, StorageBox.Footprint)) return false;
+      UnreserveFootprint(b.AnchorFx, b.AnchorFz, StorageBox.Footprint);
+      return true;
+    });
   }
 
   // --- Campfires ---
@@ -1225,6 +1241,43 @@ public class TileMap
     return true;
   }
 
+  // --- Storage boxes -------------------------------------------------------
+
+  public IReadOnlyList<StorageBox> StorageBoxes => _storageBoxes;
+
+  // Same open-ground rule as a campfire — solid footprint, nothing already
+  // reserved there, no standing water underneath.
+  public bool CanPlaceStorageBox(int anchorFx, int anchorFz)
+  {
+    if (!FootprintClear(anchorFx, anchorFz, StorageBox.Footprint)) return false;
+    foreach (var (fx, fz) in FootprintVoxels(anchorFx, anchorFz, StorageBox.Footprint))
+      if (_waterSim.DepthAt(fx, fz) > 0f) return false;
+    return true;
+  }
+
+  public StorageBox? PlaceStorageBox(int anchorFx, int anchorFz)
+  {
+    if (!CanPlaceStorageBox(anchorFx, anchorFz)) return null;
+
+    var box = new StorageBox(anchorFx, anchorFz);
+    _storageBoxes.Add(box);
+    ReserveFootprint(anchorFx, anchorFz, StorageBox.Footprint, StorageBox.Height);
+    return box;
+  }
+
+  // Whatever food was still inside is lost, same simplicity as demolishing a
+  // campfire — no material recovery on demolish anywhere else in the game
+  // either.
+  public bool RemoveStorageBox(int anchorFx, int anchorFz)
+  {
+    int index = _storageBoxes.FindIndex(b => b.AnchorFx == anchorFx && b.AnchorFz == anchorFz);
+    if (index < 0) return false;
+
+    _storageBoxes.RemoveAt(index);
+    UnreserveFootprint(anchorFx, anchorFz, StorageBox.Footprint);
+    return true;
+  }
+
   // A point light per light post, steady and faint blue — the whole point
   // is to mark a path at night without turning it into another campfire, so
   // this deliberately skips Flicker's per-frame animation. Height matches
@@ -1582,6 +1635,36 @@ public class TileMap
   const float StoneRingRadius = TileSize * 0.42f;
   static readonly Color LogColor = new(92, 58, 34, 255);
   static readonly Color[] StoneColors = { new(120, 120, 118, 255), new(102, 102, 100, 255), new(134, 132, 128, 255) };
+
+  // A squat iron chest: a wide body plus a thinner banded "lid" trim near
+  // the top, dark gunmetal-gray so it reads as metal next to the wood/stone
+  // campfire and the light post. Sized as a fraction of the box's own
+  // Footprint (in VoxelSize units) rather than an arbitrary TileSize
+  // multiple — tying the visible chest to its actual collision footprint is
+  // what keeps a big-capacity box from rendering absurdly larger than the
+  // ground it actually occupies.
+  static readonly Color StorageBoxBodyColor = new(70, 72, 78, 255);
+  static readonly Color StorageBoxTrimColor = new(40, 41, 45, 255);
+  const float StorageBoxWidth = VoxelSize * StorageBox.Footprint * 0.8f;
+  const float StorageBoxDepth = VoxelSize * StorageBox.Footprint * 0.8f;
+  const float StorageBoxBodyHeight = VoxelSize * 5.5f; // roughly waist-high on an actor
+  const float StorageBoxTrimHeight = VoxelSize * 0.8f;
+
+  public void DrawStorageBoxesLit()
+  {
+    foreach (var box in _storageBoxes)
+    {
+      float worldX = box.AnchorFx * VoxelSize + VoxelSize / 2f;
+      float worldZ = box.AnchorFz * VoxelSize + VoxelSize / 2f;
+      float baseY = SmoothSurfaceY(worldX, worldZ);
+
+      Vector3 bodyCenter = new(worldX, baseY + StorageBoxBodyHeight / 2f, worldZ);
+      Raylib.DrawCube(bodyCenter, StorageBoxWidth, StorageBoxBodyHeight, StorageBoxDepth, StorageBoxBodyColor);
+
+      Vector3 trimCenter = new(worldX, baseY + StorageBoxBodyHeight - StorageBoxTrimHeight / 2f, worldZ);
+      Raylib.DrawCube(trimCenter, StorageBoxWidth * 1.03f, StorageBoxTrimHeight, StorageBoxDepth * 1.03f, StorageBoxTrimColor);
+    }
+  }
 
   public void DrawCampfiresLit()
   {

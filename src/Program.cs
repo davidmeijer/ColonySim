@@ -119,6 +119,11 @@ public static class Program
 
         public Vector2? RightDownPos;
         public bool RightDragged;
+
+        // The single actor currently shown in the inspect popup (name/hunger/
+        // health), if any — set by a plain single click in UpdateSelection,
+        // cleared by clicking elsewhere, closing the popup, or the actor dying.
+        public Actor? Inspected;
     }
 
     // The action menu: a few buttons that appear along the bottom of the
@@ -187,12 +192,12 @@ public static class Program
     static readonly Rectangle BuildButtonRect = new(260, 10, 36, 36);
 
     // Which tool (if any) is currently armed from the build palette.
-    public enum ToolKind { None, Campfire, DemolishCampfire, Spring, DemolishSpring, LightPost, DemolishLightPost, Dig, Deposit, AirStrike }
+    public enum ToolKind { None, Campfire, DemolishCampfire, Spring, DemolishSpring, LightPost, DemolishLightPost, Dig, Deposit, AirStrike, StorageBox, DemolishStorageBox, HarvestBush }
 
     const float BuildPanelWidth = 150f;
     const float BuildPanelX = 260f;
     const float BuildPanelY = 56f;
-    const int BuildPaletteRows = 9;
+    const int BuildPaletteRows = 12;
     const float BuildRowHeight = 46f;
     static readonly Rectangle BuildPanelRect = new(BuildPanelX, BuildPanelY, BuildPanelWidth, 8f + BuildPaletteRows * BuildRowHeight);
 
@@ -206,6 +211,9 @@ public static class Program
     static readonly Rectangle DigItemRect = BuildPaletteItemRect(6);
     static readonly Rectangle DepositItemRect = BuildPaletteItemRect(7);
     static readonly Rectangle AirStrikeItemRect = BuildPaletteItemRect(8);
+    static readonly Rectangle StorageBoxItemRect = BuildPaletteItemRect(9);
+    static readonly Rectangle DemolishStorageBoxItemRect = BuildPaletteItemRect(10);
+    static readonly Rectangle HarvestBushItemRect = BuildPaletteItemRect(11);
 
     public class BuildMenuState
     {
@@ -246,6 +254,25 @@ public static class Program
     static Rectangle TaskQueueCancelRect(int row) =>
         new(QueuePanelX + QueuePanelWidth - 26, QueuePanelY + 34 + row * QueueRowHeight + 4, 18, 18);
 
+    // --- Actor inspect popup (top-center) -----------------------------------
+    // Sits clear of every corner widget: the build button/palette (top-left),
+    // the task queue panel (left edge), and the settings gear/panel
+    // (top-right) all leave the top-center strip free.
+    const float InspectPanelWidth = 260f;
+    const float InspectPanelHeight = 132f;
+    static readonly Rectangle InspectPanelRect = new((ScreenWidth - InspectPanelWidth) / 2f, 10f, InspectPanelWidth, InspectPanelHeight);
+    static readonly Rectangle InspectCloseButtonRect = new(InspectPanelRect.X + InspectPanelWidth - 28f, InspectPanelRect.Y + 6f, 20f, 20f);
+
+    // A tiny portrait built from the actor's own cosmetic colours (skin +
+    // shirt) rather than a loaded image — same "hand-drawn from the actual
+    // model's data" spirit as everything else in this game.
+    static readonly Vector2 InspectPortraitHeadCenter = new(InspectPanelRect.X + 32f, InspectPanelRect.Y + 30f);
+    const float InspectPortraitHeadRadius = 14f;
+    static readonly Rectangle InspectPortraitBodyRect = new(InspectPanelRect.X + 14f, InspectPanelRect.Y + 44f, 36f, 22f);
+
+    static readonly Rectangle InspectHungerBarTrack = new(InspectPanelRect.X + 14f, InspectPanelRect.Y + 76f, InspectPanelWidth - 28f, 10f);
+    static readonly Rectangle InspectHealthBarTrack = new(InspectPanelRect.X + 14f, InspectPanelRect.Y + 108f, InspectPanelWidth - 28f, 10f);
+
     // --- Work task timing/tuning --------------------------------------------
     // Dig/Deposit always move exactly one voxel, so their duration is just
     // a flat per-action time rather than scaling with any distance/count.
@@ -261,6 +288,13 @@ public static class Program
 
     const float BuildLightPostDuration = 1f;
     const float DemolishLightPostDuration = 0.5f;
+
+    // A real iron box takes longer to assemble than a wooden light post;
+    // harvesting a bush is quick, chop-style work, like Dig.
+    const float BuildStorageBoxDuration = 3f;
+    const float DemolishStorageBoxDuration = 1f;
+    const float HarvestBushDuration = 2.5f;
+    const int HarvestBushFoodYield = 15;
 
     // Safety clamp on a single drag-select's footprint (Dig/Deposit) — the
     // queue and per-frame builder scans are all O(task count), so a stray
@@ -502,8 +536,9 @@ public static class Program
         // otherwise clicking "Jump" would also register as a world click and
         // immediately clear the very selection you just acted on.
         bool menuConsumedClick = !armed && UpdateActionMenu(map, selection);
+        bool inspectConsumedClick = !armed && UpdateInspectPanel(selection);
         UpdateSelection(actors, selection, camera, shiftHeld,
-            menuConsumedClick || settingsConsumedClick || buildConsumedClick || queueConsumedClick || saveConsumedClick);
+            menuConsumedClick || settingsConsumedClick || buildConsumedClick || queueConsumedClick || saveConsumedClick || inspectConsumedClick);
         if (!armed) UpdateMoveOrders(map, selection, camera, workQueue);
 
         // Everyone seeks their own next waypoint independently — no per-tile
@@ -515,6 +550,7 @@ public static class Program
         foreach (var actor in actors) actor.Update(dt);
         ResolveOverlaps(actors);
         RepathStuckActors(map, actors);
+        UpdateHunger(map, actors, selection, workQueue);
         UpdateBuilders(map, actors, workQueue, globalInventory, session.ItemDrops, dt);
         UpdateWandering(map, actors, workQueue);
         UpdateAirStrikes(session.AirStrikes, map, dt);
@@ -618,6 +654,57 @@ public static class Program
         actor.StopWorking();
     }
 
+    // Every actor's hunger/health/death, independent of IsBuilder — everyone
+    // has to eat, not just builders. Eating is the one autonomous behaviour
+    // in the whole game (everything else is a player-queued WorkTask): an
+    // actor notices it's hungry (Actor.WantsToEat) and self-paths to the
+    // nearest stocked StorageBox, the same SetPath plumbing a manual order
+    // or a wander uses. Runs after actor.Update (so this frame's Hunger/
+    // Health decay has already applied) and before UpdateBuilders (so a
+    // hungry builder's claimed task is freed before TryAssignTask can hand
+    // it something new).
+    static void UpdateHunger(TileMap map, List<Actor> actors, SelectionState selection, WorkQueue workQueue)
+    {
+        for (int i = actors.Count - 1; i >= 0; i--)
+        {
+            var actor = actors[i];
+
+            if (actor.IsDead)
+            {
+                if (selection.Inspected == actor) selection.Inspected = null;
+                selection.Selected.Remove(actor);
+                ReleaseAssignment(workQueue, actor);
+                actors.RemoveAt(i);
+                continue;
+            }
+
+            if (actor.WantsToEat)
+            {
+                if (actor.IsBuilder) ReleaseAssignment(workQueue, actor);
+
+                var target = map.StorageBoxes
+                    .Where(b => b.Storage.Has("Food", Actor.EatFoodCost))
+                    .Cast<StorageBox?>()
+                    .OrderBy(b => Math.Abs(b!.Value.AnchorFx - actor.FineX) + Math.Abs(b.Value.AnchorFz - actor.FineZ))
+                    .FirstOrDefault();
+
+                if (target is { } box &&
+                    NearestWalkableNeighborOfFootprint(map, box.AnchorFx, box.AnchorFz, StorageBox.Footprint) is { } stand)
+                {
+                    var path = AStar.FindPath(map, actor.FineX, actor.FineZ, stand.Fx, stand.Fz, Actor.FootprintSize, Actor.HeightVoxels);
+                    if (path.Count > 0) { actor.SetPath(path); actor.BeginSeekingFood(box.AnchorFx, box.AnchorFz); }
+                }
+                // else: nothing reachable/stocked right now — tried again next frame, since WantsToEat still holds.
+            }
+            else if (actor.IsSeekingFood && !actor.IsMoving && actor.FoodTargetAnchor is { } anchor)
+            {
+                var box = map.StorageBoxes.FirstOrDefault(b => b.AnchorFx == anchor.Fx && b.AnchorFz == anchor.Fz);
+                if (box.Storage != null && box.Storage.TryRemove("Food", Actor.EatFoodCost)) actor.Eat();
+                else actor.CancelSeekingFood(); // box emptied/removed since setting out — re-scan next frame
+            }
+        }
+    }
+
     // Every IsBuilder actor either keeps working whatever WorkTask it's
     // already holding, or — once truly idle — claims the next one it can
     // actually do. Runs after RepathStuckActors (so a builder's own
@@ -705,7 +792,7 @@ public static class Program
     // (deposit-lean) pose or the destructive (dig-chop) one.
     static bool IsConstructive(WorkTask task) => task.Kind switch
     {
-        TaskKind.BuildCampfire or TaskKind.BuildSpring or TaskKind.BuildLightPost or TaskKind.Deposit => true,
+        TaskKind.BuildCampfire or TaskKind.BuildSpring or TaskKind.BuildLightPost or TaskKind.BuildStorageBox or TaskKind.Deposit => true,
         _ => false,
     };
 
@@ -722,8 +809,33 @@ public static class Program
         TaskKind.DemolishSpring => map.RemoveSpring(task.FineX, task.FineZ),
         TaskKind.BuildLightPost => map.PlaceLightPost(task.FineX, task.FineZ) != null,
         TaskKind.DemolishLightPost => map.RemoveLightPost(task.FineX, task.FineZ),
+        TaskKind.BuildStorageBox => map.PlaceStorageBox(task.FineX, task.FineZ) != null,
+        TaskKind.DemolishStorageBox => map.RemoveStorageBox(task.FineX, task.FineZ),
+        TaskKind.HarvestBush => CompleteHarvestBush(task, map, globalInventory),
         _ => true,
     };
+
+    // Removes the harvested bush and hands its yield straight to the
+    // nearest storage box with room (see the plan's scope decision: food
+    // gathering is player-directed like everything else, delivery is
+    // automatic so it doesn't need a second manual "carry it over" task).
+    // Falls back to the shared global pool if no box exists yet (or all are
+    // full) so the food isn't simply lost — it just can't be eaten from
+    // until a box exists.
+    static bool CompleteHarvestBush(WorkTask task, TileMap map, Inventory globalInventory)
+    {
+        if (!map.RemoveBush(task.FineX, task.FineZ)) return true; // already gone — not a stall
+
+        var nearest = map.StorageBoxes
+            .Where(b => b.Storage.Room > 0)
+            .OrderBy(b => Math.Abs(b.AnchorFx - task.FineX) + Math.Abs(b.AnchorFz - task.FineZ))
+            .Cast<StorageBox?>()
+            .FirstOrDefault();
+
+        int stored = nearest is { } box ? box.Storage.Add("Food", HarvestBushFoodYield) : 0;
+        if (stored < HarvestBushFoodYield) globalInventory.Add("Food", HarvestBushFoodYield - stored);
+        return true;
+    }
 
     // A voxel that's since become undiggable (someone else got there first,
     // or the terrain changed underneath) is still a "done, nothing more to
@@ -774,6 +886,25 @@ public static class Program
         }
 
         return Raylib.CheckCollisionPointRec(mouse, TaskQueuePanelRect(workQueue.Tasks.Count));
+    }
+
+    // The inspect popup's own close "x" — same consumed-click contract as
+    // UpdateTaskQueuePanel: false (consuming nothing) when there's nothing
+    // to show, true for any click anywhere inside the panel so it doesn't
+    // also fall through to a world click/deselect.
+    static bool UpdateInspectPanel(SelectionState selection)
+    {
+        if (selection.Inspected == null) return false;
+        if (!Raylib.IsMouseButtonPressed(MouseButton.Left)) return false;
+
+        Vector2 mouse = Raylib.GetMousePosition();
+        if (Raylib.CheckCollisionPointRec(mouse, InspectCloseButtonRect))
+        {
+            selection.Inspected = null;
+            return true;
+        }
+
+        return Raylib.CheckCollisionPointRec(mouse, InspectPanelRect);
     }
 
     // How far (in fine voxels — roughly 4 old coarse tiles' worth) an idle
@@ -999,11 +1130,13 @@ public static class Program
                     {
                         selection.Selected.Clear();
                         selection.Selected.Add(clicked);
+                        selection.Inspected = clicked;
                     }
                 }
                 else if (!shiftHeld)
                 {
                     selection.Selected.Clear();
+                    selection.Inspected = null;
                 }
             }
 
@@ -1189,6 +1322,9 @@ public static class Program
             if (Raylib.CheckCollisionPointRec(mouse, DigItemRect)) { menu.ArmedTool = ToolKind.Dig; menu.Open = false; return true; }
             if (Raylib.CheckCollisionPointRec(mouse, DepositItemRect)) { menu.ArmedTool = ToolKind.Deposit; menu.Open = false; return true; }
             if (Raylib.CheckCollisionPointRec(mouse, AirStrikeItemRect)) { menu.ArmedTool = ToolKind.AirStrike; menu.Open = false; return true; }
+            if (Raylib.CheckCollisionPointRec(mouse, StorageBoxItemRect)) { menu.ArmedTool = ToolKind.StorageBox; menu.Open = false; return true; }
+            if (Raylib.CheckCollisionPointRec(mouse, DemolishStorageBoxItemRect)) { menu.ArmedTool = ToolKind.DemolishStorageBox; menu.Open = false; return true; }
+            if (Raylib.CheckCollisionPointRec(mouse, HarvestBushItemRect)) { menu.ArmedTool = ToolKind.HarvestBush; menu.Open = false; return true; }
 
             if (Raylib.CheckCollisionPointRec(mouse, BuildPanelRect)) return true;
 
@@ -1210,7 +1346,7 @@ public static class Program
     {
         if (!TryPickVoxel(map, camera, Raylib.GetMousePosition(), out int fx, out int fz))
         {
-            if (menu.ArmedTool is ToolKind.Campfire or ToolKind.Spring or ToolKind.LightPost or ToolKind.AirStrike) menu.ArmedTool = ToolKind.None;
+            if (menu.ArmedTool is ToolKind.Campfire or ToolKind.Spring or ToolKind.LightPost or ToolKind.AirStrike or ToolKind.StorageBox) menu.ArmedTool = ToolKind.None;
             return;
         }
 
@@ -1266,6 +1402,32 @@ public static class Program
             case ToolKind.AirStrike:
                 airStrikes.Add(new AirStrike(map, fx, fz));
                 menu.ArmedTool = ToolKind.None;
+                break;
+
+            case ToolKind.StorageBox:
+                if (map.CanPlaceStorageBox(fx, fz) &&
+                    NearestWalkableNeighborOfFootprint(map, fx, fz, StorageBox.Footprint) is { } boxBuildStand)
+                {
+                    workQueue.Enqueue(new WorkTask(TaskKind.BuildStorageBox, fx, fz, boxBuildStand.Fx, boxBuildStand.Fz, BuildStorageBoxDuration));
+                }
+                menu.ArmedTool = ToolKind.None;
+                break;
+
+            case ToolKind.DemolishStorageBox:
+                if (map.StorageBoxes.FirstOrDefault(b => TileMap.FootprintContains(b.AnchorFx, b.AnchorFz, StorageBox.Footprint, fx, fz)) is { } box &&
+                    NearestWalkableNeighborOfFootprint(map, box.AnchorFx, box.AnchorFz, StorageBox.Footprint) is { } boxStand)
+                {
+                    workQueue.Enqueue(new WorkTask(TaskKind.DemolishStorageBox, box.AnchorFx, box.AnchorFz, boxStand.Fx, boxStand.Fz, DemolishStorageBoxDuration));
+                }
+                break;
+
+            case ToolKind.HarvestBush:
+                if (map.Bushes.FirstOrDefault(b => TileMap.FootprintContains(b.AnchorFx, b.AnchorFz, Bush.Footprint, fx, fz)) is { } bush &&
+                    NearestWalkableNeighborOfFootprint(map, bush.AnchorFx, bush.AnchorFz, Bush.Footprint) is { } bushStand &&
+                    !workQueue.HasPendingVoxelTask(TaskKind.HarvestBush, bush.AnchorFx, bush.AnchorFz))
+                {
+                    workQueue.Enqueue(new WorkTask(TaskKind.HarvestBush, bush.AnchorFx, bush.AnchorFz, bushStand.Fx, bushStand.Fz, HarvestBushDuration));
+                }
                 break;
         }
     }
@@ -1466,6 +1628,7 @@ public static class Program
         map.DrawCampfiresLit();
         map.DrawSpringsLit();
         map.DrawLightPostsLit();
+        map.DrawStorageBoxesLit();
         foreach (var actor in actors) actor.DrawSolid(showPathDots);
         foreach (var drop in session.ItemDrops) drop.Draw();
         foreach (var strike in session.AirStrikes) strike.DrawLit();
@@ -1502,14 +1665,16 @@ public static class Program
         // falls inside, so the outline shows the real thing about to be
         // removed, not a footprint centred wherever happened to be clicked.
         if (buildMenu.ArmedTool is ToolKind.Campfire or ToolKind.DemolishCampfire or ToolKind.Spring or ToolKind.DemolishSpring
-                or ToolKind.LightPost or ToolKind.DemolishLightPost &&
+                or ToolKind.LightPost or ToolKind.DemolishLightPost or ToolKind.StorageBox or ToolKind.DemolishStorageBox or ToolKind.HarvestBush &&
             TryPickVoxel(map, camera, Raylib.GetMousePosition(), out int hoverFx, out int hoverFz))
         {
             int footprintSize = buildMenu.ArmedTool switch
             {
                 ToolKind.Campfire or ToolKind.DemolishCampfire => Campfire.Footprint,
                 ToolKind.Spring or ToolKind.DemolishSpring => Spring.Footprint,
-                _ => LightPost.Footprint,
+                ToolKind.LightPost or ToolKind.DemolishLightPost => LightPost.Footprint,
+                ToolKind.StorageBox or ToolKind.DemolishStorageBox => StorageBox.Footprint,
+                _ => Bush.Footprint, // HarvestBush
             };
 
             bool valid;
@@ -1525,6 +1690,9 @@ public static class Program
                 case ToolKind.LightPost:
                     valid = map.CanPlaceLightPost(hoverFx, hoverFz);
                     break;
+                case ToolKind.StorageBox:
+                    valid = map.CanPlaceStorageBox(hoverFx, hoverFz);
+                    break;
                 case ToolKind.DemolishCampfire:
                     (valid, anchorFx, anchorFz) = FindHoveredFootprint(
                         map.Campfires.Select(f => (f.AnchorFx, f.AnchorFz)), footprintSize, hoverFx, hoverFz);
@@ -1533,21 +1701,33 @@ public static class Program
                     (valid, anchorFx, anchorFz) = FindHoveredFootprint(
                         map.Springs.Select(s => (s.AnchorFx, s.AnchorFz)), footprintSize, hoverFx, hoverFz);
                     break;
-                default: // DemolishLightPost
+                case ToolKind.DemolishLightPost:
                     (valid, anchorFx, anchorFz) = FindHoveredFootprint(
                         map.LightPosts.Select(l => (l.AnchorFx, l.AnchorFz)), footprintSize, hoverFx, hoverFz);
+                    break;
+                case ToolKind.DemolishStorageBox:
+                    (valid, anchorFx, anchorFz) = FindHoveredFootprint(
+                        map.StorageBoxes.Select(b => (b.AnchorFx, b.AnchorFz)), footprintSize, hoverFx, hoverFz);
+                    break;
+                default: // HarvestBush
+                    (valid, anchorFx, anchorFz) = FindHoveredFootprint(
+                        map.Bushes.Select(b => (b.AnchorFx, b.AnchorFz)), footprintSize, hoverFx, hoverFz);
                     break;
             }
 
             // Springs preview blue rather than the campfire's orange — they're
             // the one build tool whose whole point is water; light posts get
-            // their own pale cyan, close to the actual glow colour they cast.
+            // their own pale cyan, close to the actual glow colour they cast;
+            // storage boxes preview a metallic silver; harvesting a bush
+            // previews leafy green.
             Color outlineColor = !valid
                 ? new Color(220, 60, 60, 220)
                 : buildMenu.ArmedTool switch
                 {
                     ToolKind.Spring or ToolKind.DemolishSpring => new Color(80, 170, 255, 220),
                     ToolKind.LightPost or ToolKind.DemolishLightPost => new Color(140, 210, 255, 220),
+                    ToolKind.StorageBox or ToolKind.DemolishStorageBox => new Color(190, 190, 200, 220),
+                    ToolKind.HarvestBush => new Color(120, 200, 90, 220),
                     _ => new Color(255, 170, 60, 220),
                 };
 
@@ -1602,6 +1782,23 @@ public static class Program
             Raylib.DrawRectangle((int)track.X, (int)track.Y, (int)(t * track.Width), (int)track.Height, new Color(120, 190, 120, 255));
         }
 
+        // A floating "Food: x / capacity" label over every storage box, so
+        // its stock level is visible at a glance without having to click
+        // anything — there was previously no way to see this at all.
+        foreach (var box in map.StorageBoxes)
+        {
+            float worldX = box.AnchorFx * TileMap.VoxelSize + TileMap.VoxelSize / 2f;
+            float worldZ = box.AnchorFz * TileMap.VoxelSize + TileMap.VoxelSize / 2f;
+            float labelY = map.SmoothSurfaceY(worldX, worldZ) + TileMap.TileSize * 0.9f;
+            Vector2 screenPos = Raylib.GetWorldToScreen(new Vector3(worldX, labelY, worldZ), camera);
+
+            box.Storage.Counts.TryGetValue("Food", out int food);
+            string label = $"Food: {food:N0}/{box.Storage.Capacity:N0}";
+            int textWidth = Raylib.MeasureText(label, 14);
+            Raylib.DrawRectangle((int)(screenPos.X - textWidth / 2f - 4), (int)screenPos.Y - 2, textWidth + 8, 18, new Color(245, 245, 245, 200));
+            Raylib.DrawText(label, (int)(screenPos.X - textWidth / 2f), (int)screenPos.Y, 14, Color.Black);
+        }
+
         // The HUD is drawn in *screen* space, so it stays put.
         string globalItems = globalInventory.Counts.Count == 0
             ? "(empty)"
@@ -1620,6 +1817,7 @@ public static class Program
         DrawBuildMenu(buildMenu);
         DrawTaskQueue(workQueue);
         DrawSaveButton(session);
+        DrawInspectPanel(selection);
 
         // The action menu, only while something's selected.
         if (selection.Selected.Count > 0)
@@ -1762,6 +1960,44 @@ public static class Program
                 (int)(QueuePanelY + 34 + shown * QueueRowHeight), 14, Color.DarkGray);
     }
 
+    // Name, builder badge, and Hunger/Health meters for whichever actor was
+    // last plain-clicked (see UpdateSelection) — mirrors DrawTaskQueue's own
+    // gray-track/coloured-fill bar for Duration/Progress, just fed Hunger/
+    // Health instead. Nothing to draw once the actor's gone (dead — see
+    // UpdateHunger, which clears Inspected itself the same frame).
+    static void DrawInspectPanel(SelectionState selection)
+    {
+        if (selection.Inspected is not { } actor) return;
+
+        Raylib.DrawRectangleRec(InspectPanelRect, new Color(245, 245, 245, 235));
+        Raylib.DrawRectangleLinesEx(InspectPanelRect, 1.5f, Color.DarkGray);
+
+        // The portrait: shirt-colour body behind a skin-colour head, drawn
+        // from the same two colours this actor's real 3D model uses.
+        Raylib.DrawRectangleRounded(InspectPortraitBodyRect, 0.3f, 6, actor.ShirtColor);
+        Raylib.DrawCircleV(InspectPortraitHeadCenter, InspectPortraitHeadRadius, Actor.SkinColor);
+        Raylib.DrawCircleLinesV(InspectPortraitHeadCenter, InspectPortraitHeadRadius, new Color(0, 0, 0, 60));
+
+        string title = actor.Name + (actor.IsBuilder ? "  [Builder]" : "");
+        Raylib.DrawText(title, (int)InspectPortraitBodyRect.X + 46, (int)InspectPanelRect.Y + 26, 18, Color.Black);
+
+        DrawStatBar("Hunger", actor.Hunger, InspectHungerBarTrack, new Color(220, 170, 60, 255));
+        DrawStatBar("Health", actor.Health, InspectHealthBarTrack, new Color(200, 80, 80, 255));
+
+        Raylib.DrawRectangleRec(InspectCloseButtonRect, new Color(230, 120, 120, 255));
+        Raylib.DrawText("x", (int)(InspectCloseButtonRect.X + 6), (int)(InspectCloseButtonRect.Y + 2), 14, Color.Black);
+    }
+
+    // A labeled 0-100 meter: gray track, proportional coloured fill, value
+    // as text above it — the same shape DrawTaskQueue's progress bars use.
+    static void DrawStatBar(string label, float value, Rectangle track, Color fillColor)
+    {
+        Raylib.DrawText($"{label}: {value:0}", (int)track.X, (int)track.Y - 16, 14, Color.Black);
+        Raylib.DrawRectangleRec(track, new Color(210, 210, 210, 255));
+        float t = Math.Clamp(value / 100f, 0f, 1f);
+        Raylib.DrawRectangle((int)track.X, (int)track.Y, (int)(t * track.Width), (int)track.Height, fillColor);
+    }
+
     // active marks a toggle button as currently "on" (e.g. the grid button
     // while the grid is showing) with a darker fill, independent of hover.
     static void DrawButton(Rectangle rect, string label, bool active = false)
@@ -1816,6 +2052,9 @@ public static class Program
                 ToolKind.DemolishLightPost => "Click a light post to remove it (Esc / right-click to cancel)",
                 ToolKind.Dig or ToolKind.Deposit => "Click a voxel, or drag to select several (Esc / right-click to cancel)",
                 ToolKind.AirStrike => "Click a spot to call in an air strike (Esc / right-click to cancel)",
+                ToolKind.StorageBox => "Click a tile to place the storage box (Esc / right-click to cancel)",
+                ToolKind.DemolishStorageBox => "Click a storage box to demolish it (Esc / right-click to cancel)",
+                ToolKind.HarvestBush => "Click a bush to harvest it for food (Esc / right-click to cancel)",
                 _ => "",
             };
             Raylib.DrawText(hint, (int)BuildButtonRect.X, (int)(BuildButtonRect.Y + BuildButtonRect.Height + 6), 16, Color.Black);
@@ -1835,6 +2074,9 @@ public static class Program
         DrawButton(DigItemRect, "Dig");
         DrawButton(DepositItemRect, "Deposit");
         DrawButton(AirStrikeItemRect, "Air Strike");
+        DrawButton(StorageBoxItemRect, "Storage Box");
+        DrawButton(DemolishStorageBoxItemRect, "Remove Storage");
+        DrawButton(HarvestBushItemRect, "Harvest Bush");
     }
 
     // A gear-shaped icon button: a ring of teeth around a circular hub,

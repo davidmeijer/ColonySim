@@ -62,6 +62,9 @@ public class WorkTask
     TaskKind.DemolishSpring => $"Cap spring ({FineX},{FineZ})",
     TaskKind.BuildLightPost => $"Build light post ({FineX},{FineZ})",
     TaskKind.DemolishLightPost => $"Remove light post ({FineX},{FineZ})",
+    TaskKind.BuildStorageBox => $"Build storage box ({FineX},{FineZ})",
+    TaskKind.DemolishStorageBox => $"Demolish storage box ({FineX},{FineZ})",
+    TaskKind.HarvestBush => $"Harvest bush ({FineX},{FineZ})",
     _ => Kind.ToString(),
   };
 }

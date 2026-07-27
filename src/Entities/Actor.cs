@@ -136,7 +136,7 @@ public class Actor
   const float ArmLength = TileMap.TileSize * 0.34f;
   const float ArmThickness = TileMap.TileSize * 0.09f;
 
-  static readonly Color SkinColor = new(224, 172, 132, 255);
+  public static readonly Color SkinColor = new(224, 172, 132, 255);
   static readonly Color PantsColor = new(64, 60, 58, 255);
 
   // Two "eye" squares on the front of the head — otherwise arms, legs,
@@ -162,6 +162,77 @@ public class Actor
   };
   static int _nextShirtIndex;
   readonly Color _shirtColor;
+
+  // --- Identity -----------------------------------------------------------
+  // A random first name, picked once at spawn — just enough for the inspect
+  // popup (see Program.DrawInspectPanel) to read as "someone", not "Actor 2".
+  public string Name { get; }
+
+  // Exposed so the inspect popup (Program.DrawInspectPanel) can draw a small
+  // "portrait" out of this actor's actual cosmetic colours instead of
+  // showing nothing where the player asked for a face.
+  public Color ShirtColor => _shirtColor;
+
+  static readonly string[] NamePalette =
+  {
+    "Ada", "Bram", "Cora", "Dov", "Esme", "Finn", "Greta", "Hugo",
+    "Iris", "Jonas", "Kira", "Leif", "Mira", "Nils", "Opal", "Piet",
+  };
+
+  // --- Needs: hunger/health/death ------------------------------------------
+  // Hunger drains steadily; once it bottoms out, Health starts draining
+  // instead — a grace window rather than instant death, so a player who
+  // notices in time can still save the actor. Program.UpdateHunger owns the
+  // actual "walk to a storage box and eat" behaviour; this class only
+  // tracks the numbers and exposes WantsToEat, mirroring how WantsToWander
+  // exposes readiness without owning the pathfinding itself.
+  public float Hunger { get; private set; } = 100f;
+  public float Health { get; private set; } = 100f;
+  public bool IsDead { get; private set; }
+
+  // Set once Program has sent this actor toward a specific storage box for
+  // a meal, so WantsToEat doesn't keep re-triggering every frame while it's
+  // already on its way, and so arrival can be matched back to that same box.
+  public bool IsSeekingFood { get; private set; }
+  public (int Fx, int Fz)? FoodTargetAnchor { get; private set; }
+
+  const float HungryThreshold = 40f;
+  const float HungerFullToEmptySeconds = 300f; // ~5 minutes at full activity
+  const float HungerDecayPerSec = 100f / HungerFullToEmptySeconds;
+  const float HealthDrainSeconds = 90f; // grace window once starving before death
+  const float HealthDecayPerSec = 100f / HealthDrainSeconds;
+  public const float EatHungerRestore = 70f;
+  public const int EatFoodCost = 20;
+
+  public bool WantsToEat => !IsDead && Hunger <= HungryThreshold && !IsSeekingFood;
+
+  public void BeginSeekingFood(int anchorFx, int anchorFz)
+  {
+    IsSeekingFood = true;
+    FoodTargetAnchor = (anchorFx, anchorFz);
+  }
+
+  public void CancelSeekingFood()
+  {
+    IsSeekingFood = false;
+    FoodTargetAnchor = null;
+  }
+
+  public void Eat()
+  {
+    Hunger = Math.Min(100f, Hunger + EatHungerRestore);
+    CancelSeekingFood();
+  }
+
+  void TickNeeds(float dt)
+  {
+    if (IsDead) return;
+
+    if (Hunger > 0f) Hunger = Math.Max(0f, Hunger - HungerDecayPerSec * dt);
+    else Health = Math.Max(0f, Health - HealthDecayPerSec * dt);
+
+    if (Health <= 0f) IsDead = true;
+  }
 
   // --- Animation state ---------------------------------------------------
   // Which way the actor is facing, smoothed toward the direction it's
@@ -206,13 +277,25 @@ public class Actor
   // Draw* methods so they agree on where the limbs are this frame.
   float _poseLeftLegDeg, _poseRightLegDeg, _poseLeftArmDeg, _poseRightArmDeg, _poseTorsoLeanDeg, _poseBreathLift;
 
-  public Actor(TileMap map, int fineX, int fineZ)
+  // name is null for a freshly spawned actor (picks a random one); SaveSystem
+  // passes the actor's saved name back in on load instead.
+  public Actor(TileMap map, int fineX, int fineZ, string? name = null)
   {
     _map = map;
     FineX = fineX;
     FineZ = fineZ;
     _worldPos = VoxelTop(fineX, fineZ);
     _shirtColor = ShirtPalette[_nextShirtIndex++ % ShirtPalette.Length];
+    Name = name ?? NamePalette[Random.Shared.Next(NamePalette.Length)];
+  }
+
+  // Only meant to be called by SaveSystem.Load right after construction, to
+  // restore hunger/health that would otherwise reset to full — same spirit
+  // as setting IsBuilder via object-initializer syntax on a fresh Actor.
+  public void RestoreNeeds(float hunger, float health)
+  {
+    Hunger = hunger;
+    Health = health;
   }
 
   // The ground position at the centre of a fine voxel — where this actor's
@@ -280,6 +363,7 @@ public class Actor
   {
     UpdateJump(dt);
     UpdateActionTimers(dt);
+    TickNeeds(dt);
 
     bool movingThisFrame = false;
     float moveDirX = 0f, moveDirZ = 0f;
